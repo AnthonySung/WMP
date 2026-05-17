@@ -281,6 +281,15 @@ tar -xzf IsaacGym_Preview_3_Package.tar.gz
 cd isaacgym/python && pip install -e .
 cd ../..
 
+或者
+
+cd /home/WMP && \
+wget https://github.com/AnthonySung/WMP/releases/download/v0.1.0-alpha/IsaacGym_Preview_3_Package.tar.gz && \
+tar -xzf IsaacGym_Preview_3_Package.tar.gz && \
+cd isaacgym/python && \
+pip install -e . && \
+python -c "import isaacgym; print('Isaac Gym 安装成功')"
+
 # 安装其他依赖
 pip install setuptools==59.5.0 ruamel_yaml==0.17.4 opencv-contrib-python
 pip install -r requirements.txt
