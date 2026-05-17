@@ -224,28 +224,169 @@ cd isaacgym/python && pip install -e .
 pip install setuptools==59.5.0 ruamel_yaml==0.17.4 opencv-contrib-python
 ```
 
-**4. 配置 VS Code Remote SSH**
+**4. 配置 SSH 连接（在 Codespace 中配置）**
 
 ```bash
-# 在本地 ~/.ssh/config 中添加：
+# 在 Codespace 终端中执行
+
+# 4.1 生成 SSH 密钥（如果还没有）
+ssh-keygen -t ed25519 -C "vast-ai"
+
+# 4.2 查看公钥并复制
+cat ~/.ssh/id_ed25519.pub
+# 输出类似：ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... root@codespace
+
+# 4.3 将公钥添加到 vast.ai 账号
+# 打开 https://cloud.vast.ai/account/  → SSH Keys → Add
+# 把上面复制的公钥粘贴进去
+
+# 4.4 配置 SSH config 方便连接
+cat >> ~/.ssh/config << 'EOF'
 Host vast-ai
-    HostName xxx.vast.ai
-    Port 12345
+    HostName xxx.vast.ai    # 替换为实例的 IP
+    Port 12345               # 替换为实例的端口
     User root
     ServerAliveInterval 60
+    StrictHostKeyChecking no
+EOF
 
-# 然后在本地 VS Code 中：
-# 1. 安装 Remote - SSH 扩展
-# 2. Ctrl+Shift+P → Remote-SSH: Connect to Host → 选择 vast-ai
-# 3. 连接成功后，在 VS Code 中打开项目文件夹
-# 4. AI 改代码后可以直接在 VS Code 终端中运行调试
+# 4.5 测试连接
+ssh vast-ai
+# 第一次连接会提示确认，输入 yes 即可
 ```
 
-**5. 调试完成后释放实例**
+**5. 安装 WMP 环境（仅需一次）**
 
 ```bash
-# 在 vast.ai 控制台停止实例，停止计费
-# 下次需要时再启动，数据会保留在磁盘上
+# SSH 连接到 vast.ai
+ssh vast-ai
+
+# 安装系统依赖
+apt-get update
+apt-get install -y build-essential ninja-build libgl1 libglib2.0-0
+
+# 克隆项目
+git clone https://github.com/AnthonySung/WMP.git
+cd WMP
+
+# 创建 conda 环境
+conda create -n wmp python=3.8 -y
+
+# 安装 PyTorch（CUDA 11.7）
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu117
+
+# 安装 Isaac Gym（从 GitHub Releases 下载）
+gh release download v0.1.0-alpha --repo AnthonySung/WMP
+tar -xzf IsaacGym_Preview_3_Package.tar.gz
+cd isaacgym/python && pip install -e .
+cd ../..
+
+# 安装其他依赖
+pip install setuptools==59.5.0 ruamel_yaml==0.17.4 opencv-contrib-python
+pip install -r requirements.txt
+
+# 验证
+python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+
+# 装好后退出 SSH
+exit
+```
+
+**6. 日常开发流程（VS Code Remote SSH + Codespace 配合）**
+
+这是最推荐的方案——**在 Codespace 中写代码，在 vast.ai 上调试**，两边用 VS Code 无缝切换。
+
+#### 第一步：在 Codespace 中写代码（不花一分钱）
+
+在 Codespace 的 VS Code 中正常使用 AI 编程助手写代码、改代码。改完后推送到 GitHub：
+
+```bash
+git add .
+git commit -m "修改了 xxx"
+git push origin master
+```
+
+#### 第二步：启动 vast.ai 实例
+
+打开 https://cloud.vast.ai/instances，找到你的实例，点击 **Start**。
+
+等待状态变为 **"Open"** 或 **"Connect"**（通常几秒到几十秒）。
+
+#### 第三步：用 VS Code Remote SSH 连接到 vast.ai
+
+在 Codespace 的 VS Code 中：
+
+1. 安装 **Remote - SSH** 扩展（如果还没装）
+2. 按 `F1` 或 `Ctrl+Shift+P`
+3. 输入 `Remote-SSH: Connect to Host` → 选择 `vast-ai`
+4. 新窗口打开后，点击 **Open Folder** → `/root/WMP`
+
+现在你就在 vast.ai 的 GPU 环境里了！可以：
+
+- 在 VS Code 终端中运行训练命令
+- 直接在 vast.ai 上拉取最新代码
+- 调试、验证代码
+
+```bash
+# 在 vast.ai 的 VS Code 终端中
+cd /root/WMP
+git pull origin master
+conda activate wmp
+
+# 运行快速调试（比如只跑 100 次迭代验证）
+python legged_gym/scripts/train.py --task=a1_amp --headless --sim_device=cuda:0 --max_iterations=100
+```
+
+#### 第四步：切回 Codespace 继续写代码
+
+调试完后，在 VS Code 中：
+
+1. `F1` → `Remote-SSH: Close Remote Connection`
+2. 自动回到 Codespace 的本地环境
+
+#### 第五步：停止 vast.ai 实例（停止计费）
+
+打开 https://cloud.vast.ai/instances，点击 **Stop**。
+
+> **注意：** 停止后环境会保留，下次 Start 后所有文件都在。每月只需付少量存储费（约 $1.4/月）。
+
+### 完整工作流图示
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Codespace（免费）                                       │
+│  ┌─────────────────────────────────────────────────────┐│
+│  │  VS Code + AI 编程助手                              ││
+│  │  写代码、改代码 → git push                          ││
+│  │  不需要 GPU，不花一分钱                              ││
+│  └─────────────────────────────────────────────────────┘│
+│                           │                              │
+│             需要调试时，Remote SSH 一键连接               │
+│                           ▼                              │
+│  ┌─────────────────────────────────────────────────────┐│
+│  │  vast.ai 云 GPU（按秒计费 $0.2/小时）                ││
+│  │  VS Code Remote SSH 直接连接                        ││
+│  │  git pull → conda activate wmp → 运行调试           ││
+│  │  调完关掉，每次调试约 $0.03（2毛钱）                  ││
+│  └─────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────┘
+```
+
+**费用总结：**
+
+| 项目 | 费用 |
+|------|------|
+| Codespace 写代码 | **免费**（在免费额度内） |
+| vast.ai 调试（10分钟/次） | **~$0.03（2毛钱）** |
+| vast.ai 存储（不开机时） | **~$1.4/月** |
+| **每月总花费（假设调试20次）** | **~$2（约15元）** |
+
+**5. 调试完成后释放实例（可选）**
+
+```bash
+# 如果长时间不用，可以在 vast.ai 控制台 Destroy 实例
+# 注意：Destroy 会删除所有数据，下次需要重新安装环境
+# 推荐用 Stop 而不是 Destroy
 ```
 
 #### 备选方案：阿里云/腾讯云 GPU 服务器
