@@ -1,0 +1,120 @@
+# =============================================================================
+# WMP 训练环境 Docker 镜像
+# 基于 README.md 构建
+# 基础: Ubuntu 22.04 + CUDA 11.7 + PyTorch + Isaac Gym Preview 3
+# Isaac Gym 从 GitHub Releases 下载
+# =============================================================================
+
+FROM nvidia/cuda:11.7.1-devel-ubuntu22.04
+
+LABEL description="WMP Project: Isaac Gym + PyTorch training environment"
+LABEL maintainer="WMP Team"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SHELL=/bin/bash
+
+# =============================================================================
+# 1. 系统基础依赖 (README.md)
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ninja-build \
+    libgl1-mesa-glx \
+    cmake \
+    curl \
+    wget \
+    git \
+    vim \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libopenblas-dev \
+    ca-certificates \
+    gh \
+    && apt-get install -y build-essential --fix-missing \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# 2. Python 虚拟环境 (README.md: python 3.8)
+# =============================================================================
+ENV CONDA_DIR=/opt/conda
+ENV PATH=$CONDA_DIR/bin:$PATH
+
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p $CONDA_DIR && \
+    rm /tmp/miniconda.sh && \
+    conda config --add channels defaults && \
+    conda config --add channels conda-forge && \
+    conda create -n wmp python=3.8 -y && \
+    conda clean -afy
+
+ENV CONDA_DEFAULT_ENV=wmp
+ENV PATH=$CONDA_DIR/envs/wmp/bin:$PATH
+
+# =============================================================================
+# 3. 安装 PyTorch (README.md: CUDA 11.7)
+# =============================================================================
+RUN pip3 install --no-cache-dir \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu117
+
+# =============================================================================
+# 4. 安装 Isaac Gym Preview 3 (README.md)
+# =============================================================================
+ARG GITHUB_REPO="AnthonySung/WMP"
+ARG GYM_RELEASE_TAG="v0.1.0-alpha"
+
+RUN echo "从 GitHub 下载 Isaac Gym Preview 3..." && \
+    gh release download "${GYM_RELEASE_TAG}" \
+    --repo "${GITHUB_REPO}" \
+    --pattern "IsaacGym_Preview_3_Package.tar.gz" \
+    --dir /tmp/ && \
+    cd /tmp && \
+    tar -xzf IsaacGym_Preview_3_Package.tar.gz && \
+    cd /tmp/isaacgym/python && \
+    pip install --no-cache-dir -e . && \
+    rm -rf /tmp/isaacgym /tmp/IsaacGym_Preview_3_Package.tar.gz
+
+# =============================================================================
+# 5. 安装其他依赖 (README.md)
+# =============================================================================
+RUN pip install --no-cache-dir setuptools==59.5.0 && \
+    pip install --no-cache-dir ruamel_yaml==0.17.4 && \
+    pip install --no-cache-dir opencv-contrib-python
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+# =============================================================================
+# 6. 验证安装
+# =============================================================================
+RUN python -c "
+import torch
+print('PyTorch:', torch.__version__)
+print('CUDA available:', torch.cuda.is_available())
+print('CUDA version:', torch.version.cuda)
+print('GPU count:', torch.cuda.device_count())
+if torch.cuda.is_available():
+    print('GPU name:', torch.cuda.get_device_name(0))
+" && \
+    python -c "
+import isaacgym
+print('Isaac Gym:', isaacgym.__version__)
+from isaacgym import gymapi
+gym = gymapi.acquire_gym()
+print('Isaac Gym API: OK')
+" && \
+    python -c "
+import numpy as np
+import matplotlib
+import trimesh
+print('NumPy:', np.__version__)
+print('Matplotlib:', matplotlib.__version__)
+print('Trimesh: OK')
+"
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
