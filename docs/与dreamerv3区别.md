@@ -1,680 +1,484 @@
-# WMP 与 DreamerV3 的区别，以及兼容两套训练范式的改造方案
+# WMP 与 DreamerV3 的区别，以及本项目的 Dreamer Branch 设计稿
 
 ## 1. 目标
 
 本文档回答两个问题：
 
-1. 当前仓库里的 WMP 和 DreamerV3 到底差在哪；
-2. 如何在**不破坏原有 WMP 体系**的前提下，引入一套 DreamerV3-style 训练路径，并做到**一键切换 WMP / DreamerV3 两个版本**。
+1. 当前仓库中的 WMP 与 DreamerV3 在训练范式上到底差在哪里；
+2. 如何在**不破坏现有 WMP 主线**的前提下，为本项目新增一条可切换的 `Dreamer Branch`。
 
-这里的重点不是简单把几个损失函数换掉，而是保证：
-
-- 原本 WMP 路线继续可用；
-- DreamerV3 路线独立存在；
-- 公共模块尽量复用；
-- 训练入口和配置入口统一；
-- 切换时不需要改代码，只改配置或命令行参数。
+本文档不是论文综述，也不是 DreamerV3 复现说明。它的目的，是为本项目的第一版 `Dreamer Branch` 给出清晰、可实现、边界明确的设计。
 
 ---
 
-## 2. DreamerV3 和 WMP 的核心区别
+## 2. 当前项目与 DreamerV3 的根本区别
 
 ### 2.1 训练闭环不同
 
-| 维度 | DreamerV3 | 当前 WMP |
-| --- | --- | --- |
-| world model 作用 | 核心训练中枢 | 主要做环境表征与预测，给控制器提供 feature |
-| 策略优化位置 | 在 latent imagination 中优化 actor / critic | 在真实环境 rollout 上优化控制器 |
-| real data 用途 | 主要用来训练 world model | 同时用于 world model 与 policy 学习 |
-| imagined rollout | 核心组件 | 当前实现不是主策略优化路径 |
-| value learning | critic 在 imagined feature 上学习 returns / value | PPO value loss + GAE 路径 |
-| imitation / motion prior | 一般不是主路径 | 当前实现中 AMP 是重要组成部分 |
+当前项目的本质是：
 
-### 2.2 方法论不同
+- world model 参与表征；
+- policy 在真实环境 rollout 上更新；
+- 策略优化仍然是 `PPO + value loss + AMP` 路线。
 
-#### DreamerV3
+关键代码位置：
 
-标准范式是：
+- [rsl_rl/runners/wmp_runner.py:242-375](../rsl_rl/runners/wmp_runner.py#L242-L375)
+- [rsl_rl/algorithms/amp_ppo.py:172-260](../rsl_rl/algorithms/amp_ppo.py#L172-L260)
+- [rsl_rl/modules/actor_critic_wmp.py:169-220](../rsl_rl/modules/actor_critic_wmp.py#L169-L220)
 
-1. 用真实交互数据训练 world model；
-2. 从 posterior latent state 出发做 imagination rollout；
-3. 在 imagined trajectory 上训练 actor 和 critic；
-4. 用 lambda return、slow target critic、normalization 等手段保证稳定；
-5. 尽量用统一配置覆盖不同任务。
+DreamerV3 的本质则是：
 
-#### 当前 WMP
+- real data 主要用于训练 world model；
+- actor / critic 在 latent imagination 中训练；
+- reward、continuation、value 都围绕 imagined trajectory 定义。
 
-更接近下面这条路线：
+所以两者的根本差异不是“是否使用 RSSM”，而是：
 
-1. 学一个能建模环境演化的 world model；
-2. 从 world model 提取 feature；
-3. 把 feature 作为策略输入的一部分；
-4. 仍然在真实环境 rollout 上用 PPO / AMP 更新控制器；
-5. 重点是视觉腿足控制、运动先验和 sim-to-real。
+> 当前 WMP 是“world model 辅助控制器”，DreamerV3 是“world model 内部直接训练行为”。
 
----
+### 2.2 world model 层已经有可复用基础
 
-## 3. 当前仓库里的 WMP 实际训练方式
-
-### 3.1 world model 部分是 Dreamer 风格
-
-当前仓库已经具备 Dreamer 风格的模型学习骨架，关键位置包括：
+当前仓库已经有 Dreamer 风格的 world model 骨架：
 
 - [dreamer/models.py](../dreamer/models.py)
-- [dreamer/configs.yaml](../dreamer/configs.yaml)
-- [dreamer/tools.py](../dreamer/tools.py)
-
-其中：
-
-- [dreamer/models.py:34-180](../dreamer/models.py#L34-L180) 定义了 `WorldModel`；
-- 内部包含 encoder、RSSM、decoder、reward head；
-- [dreamer/tools.py:717-743](../dreamer/tools.py#L717-L743) 已经有 `lambda_return()`；
-- [dreamer/configs.yaml:30-57](../dreamer/configs.yaml#L30-L57) 里已经出现了 Dreamer 风格的部分超参。
-
-这说明仓库底层的 **world model 组件已经具备复用价值**。
-
-### 3.2 但行为学习仍然是 WMP / PPO / AMP 路线
-
-当前真正的策略优化在这些文件里：
-
-- [rsl_rl/runners/wmp_runner.py:237-375](../rsl_rl/runners/wmp_runner.py#L237-L375)
-- [rsl_rl/algorithms/amp_ppo.py:169-304](../rsl_rl/algorithms/amp_ppo.py#L169-L304)
-- [rsl_rl/modules/actor_critic_wmp.py:73-220](../rsl_rl/modules/actor_critic_wmp.py#L73-L220)
-
-现有逻辑是：
-
-1. 在真实环境里 rollout；
-2. 定期用 world model 编码观测并生成 `wm_feature`；
-3. policy 使用 `history + command + wm_feature` 输出动作；
-4. 用 PPO surrogate loss、value loss、AMP discriminator loss 更新策略。
-
-所以当前实现的本质是：
-
-> world model 参与表征，但 policy optimization 并不发生在 imagination rollout 中。
-
-这正是它和 DreamerV3 的根本区别。
-
----
-
-## 4. 能不能改成 DreamerV3 训练范式
-
-### 4.1 结论
-
-**可以改，但不建议直接覆盖现有 WMP 体系。**
-
-正确做法是：
-
-- 保留当前 WMP 路线作为 `wmp` 模式；
-- 新增一条 `dreamerv3` 模式；
-- 两者共享 env、world model、数据采样与日志框架；
-- 在 runner / behavior / config 层面分叉；
-- 通过配置项或命令行参数一键切换。
-
-### 4.2 为什么可行
-
-因为当前仓库已经有以下基础：
-
-1. 已有 world model 与 RSSM；
-2. 已有 world model 训练数据采样逻辑；
-3. 已有 `lambda_return()` 工具函数；
-4. 已有单独的训练 runner 结构，便于扩展模式选择。
-
-相关位置：
-
-- [dreamer/models.py:117-180](../dreamer/models.py#L117-L180)
-- [rsl_rl/runners/wmp_runner.py:384-477](../rsl_rl/runners/wmp_runner.py#L384-L477)
+- [dreamer/networks.py](../dreamer/networks.py)
 - [dreamer/tools.py:717-743](../dreamer/tools.py#L717-L743)
-- [legged_gym/utils/task_registry.py:162-215](../legged_gym/utils/task_registry.py#L162-L215)
 
-### 4.3 为什么不能只改几行
+其中已经具备：
 
-因为缺的不是 world model，而是 **DreamerV3 的 behavior learning 闭环**，主要包括：
+- encoder；
+- RSSM；
+- decoder；
+- `reward_head` 的基础定义；
+- `lambda_return()` 工具函数。
 
-- imagined actor update；
-- imagined critic update；
-- slow target critic；
-- continuation / discount 预测；
-- 从 posterior latent 出发的 imagination rollout 训练链路。
-
-而当前代码使用的是：
-
-- PPO；
-- GAE / returns；
-- AMP imitation discriminator；
-- 真实环境 step 上的策略更新。
-
-因此这不是一个“改损失函数”的问题，而是“新增第二套训练范式”的问题。
+这意味着本项目适合新增 `Dreamer Branch`，但**不适合把现有 WMP 直接解释成 DreamerV3**。
 
 ---
 
-## 5. 改造原则：不影响原本体系，并支持一键切版本
+## 3. 设计结论
 
-### 5.1 总原则
+### 3.1 总结论
 
-必须遵守下面四条：
+本项目应保留现有 `WMP` 主线，并新增一条独立的 `Dreamer Branch`。
 
-1. **保留原 WMP 默认行为不变**；
-2. **DreamerV3 作为新增模式接入，不反向污染 WMP 逻辑**；
-3. **公共组件只复用，不强行统一行为接口**；
-4. **切换方式只依赖配置，不依赖手工改代码**。
+推荐形式：
 
-### 5.2 推荐切换方式
+- `training_mode: wmp`
+- `training_mode: dreamerv3`
 
-新增一个统一配置字段，例如：
+两条路线共享：
 
-```yaml
-training_mode: wmp
-```
+- env；
+- world model 主体；
+- world model 数据采样框架；
+- 日志与 checkpoint 基础设施。
 
-可选值：
+两条路线分叉在：
 
-- `wmp`
-- `dreamerv3`
+- behavior learning；
+- actor / critic 结构；
+- replay 语义；
+- 训练闭环。
 
-然后在训练入口根据这个字段分支。
+实现原则上应优先：
 
-如果希望命令行直接切换，也可以增加参数，例如：
+- 分 runner；
+- 分 behavior 模块；
+- 分 actor / critic 模块；
+- 共享 world model 与公共工具。
 
-```bash
-python legged_gym/scripts/train.py --task a1 --training_mode wmp
-python legged_gym/scripts/train.py --task a1 --training_mode dreamerv3
-```
+只有当代码天然属于公共基础设施时，才建议放在同一文件中，并且必须由显式 `training_mode` 或等价开关控制。
 
-这样可以做到真正的一键切换。
+### 3.2 第一版 Dreamer Branch 的已确认边界
 
----
+第一版不是纯标准 DreamerV3，而是一个**受约束的 hybrid Dreamer Branch**。
 
-## 6. 推荐的代码改造方案
+已确认的边界如下：
 
-## 6.1 第一层：保留原 WMP 路线不动
-
-当前这些文件尽量只做最小侵入式改动：
-
-- [rsl_rl/runners/wmp_runner.py](../rsl_rl/runners/wmp_runner.py)
-- [rsl_rl/algorithms/amp_ppo.py](../rsl_rl/algorithms/amp_ppo.py)
-- [rsl_rl/modules/actor_critic_wmp.py](../rsl_rl/modules/actor_critic_wmp.py)
-
-原则是：
-
-- 现有 WMP 训练逻辑继续保留；
-- 不把 DreamerV3 的损失、分支、特殊逻辑硬塞进 `AMPPPO`；
-- WMP 模式依然走原路径，保证老实验可复现。
-
-## 6.2 第二层：新增 DreamerV3-style behavior 模块
-
-建议新增一套独立行为学习模块，而不是改造 `ActorCriticWMP` 去兼容两套范式。
-
-推荐新增文件：
-
-- `rsl_rl/modules/dreamer_behavior.py`
-- `rsl_rl/modules/dreamer_actor_critic.py`
-- 或者放到 `dreamer/` 目录下也可以，但建议放在 `rsl_rl/modules/`，便于和现有 runner 集成。
-
-这个模块负责：
-
-1. 从 posterior latent 初始化 imagined rollout；
-2. actor 根据 latent feature 生成 action；
-3. RSSM 在 latent 空间里 `imagine_with_action`；
-4. critic 在 imagined features 上估值；
-5. 计算 lambda return；
-6. 更新 actor / critic / slow critic。
-
-## 6.3 第三层：给 world model 补齐 DreamerV3 所需头部
-
-当前 [dreamer/models.py:81-92](../dreamer/models.py#L81-L92) 里的 `cont_head` 是注释状态。
-
-如果要更接近 DreamerV3，应当：
-
-- 恢复或重新实现 continuation head；
-- 在 behavior learning 中使用 reward head + cont head + critic target；
-- 继续复用 [dreamer/tools.py:717-743](../dreamer/tools.py#L717-L743) 的 `lambda_return()`。
-
-## 6.4 第四层：在 runner 层做模式分发，而不是在算法内部混写
-
-当前训练入口主要经过：
-
-- [legged_gym/scripts/train.py:48-58](../legged_gym/scripts/train.py#L48-L58)
-- [legged_gym/utils/task_registry.py:162-215](../legged_gym/utils/task_registry.py#L162-L215)
-
-建议改为：
-
-1. 在 `train.py` 读取 `training_mode`；
-2. 在 `task_registry.py` 中统一创建对应 runner；
-3. `training_mode == wmp` 时走现有 `WMPRunner`；
-4. `training_mode == dreamerv3` 时走新增 `DreamerRunner`；
-5. world model 数据采样、日志目录、保存恢复接口尽量保持一致。
-
-即：
-
-- `WMPRunner`：保持原样；
-- `DreamerRunner`：新增，不污染原类。
-
-这是“可维护”和“可回滚”成本最低的方案。
+1. 保留原 `WMP` 主线，不替换现有训练路线。
+2. 第一版支持 `CLI / config` 级别切换。
+3. 第一版 replay 沿用当前 `chunk-step / world-model-step` 语义。
+4. 第一版保留视觉链路。
+5. 第一版保留 `AMP / motion prior`，但只保留在 real rollout / auxiliary side。
+6. 第一版保留 `privileged critic`，但只保留在 real rollout / bootstrap / auxiliary support side。
+7. imagined phase 默认只走 latent-path，不直接使用 AMP reward，也不直接读取 privileged observation。
+8. 第一版主 critic 是 `latent critic`。
+9. 第一版默认采用**分 runner、分模块、显式 mode switch** 的方式保留原版可回切能力；只有确实值得共享的代码才允许写在一起，并且必须受显式开关保护。
 
 ---
 
-## 7. 一键切换的最小落地设计（修正版）
+## 4. 第一版 Dreamer Branch 的训练边界
 
-### 7.1 先说结论
+### 4.1 imagined phase 包含什么
 
-“一键切换”不能只靠在文档里增加一条命令行参数。
+imagined phase 默认只包含：
 
-原因是当前参数链路并不是单点入口，而是两段解析：
+- latent state；
+- actor 产生的 action；
+- RSSM latent rollout；
+- reward prediction；
+- continuation prediction；
+- latent critic value prediction。
 
-1. 训练入口通过 [legged_gym/utils/helpers.py:155-185](../legged_gym/utils/helpers.py#L155-L185) 解析固定参数；
-2. world model 构建阶段又在 [rsl_rl/runners/wmp_runner.py:142-168](../rsl_rl/runners/wmp_runner.py#L142-L168) 里重新基于 `sys.argv` 做了一次 `argparse.parse_args()`。
+也就是说，imagined phase 的核心序列是：
 
-因此，如果直接加：
-
-```bash
-python legged_gym/scripts/train.py --task a1 --training_mode dreamerv3
+```text
+post_state_t -> action_t -> prior_state_{t+1} -> action_{t+1} -> ...
 ```
 
-在现状下大概率会失败，而不是自动生效。
+这里的 `state` 指 RSSM latent state，而不是环境原始观测。
 
-### 7.2 正确的一键切换实现方式
+相关接口：
 
-推荐分两步做。
+- [dreamer/networks.py:201-233](../dreamer/networks.py#L201-L233)
+- [dreamer/networks.py:235-260](../dreamer/networks.py#L235-L260)
+- [dreamer/networks.py:178-186](../dreamer/networks.py#L178-L186)
 
-#### 方案 A：先走配置切换，再补命令行切换
+### 4.2 imagined phase 不包含什么
 
-第一阶段先只支持配置切换：
+第一版 imagined phase 默认不直接包含：
 
-```python
-class runner:
-    training_mode = 'wmp'
-```
+- 当前 AMP reward；
+- 当前 privileged observation；
+- 环境侧 `critic_observations`；
+- 真实 `amp_obs -> next_amp_obs` transition。
 
-这样修改范围最可控，因为：
+原因不是这些信息无价值，而是它们都属于 **real-only signals**，当前并不天然存在于 latent rollout 里。
 
-- `task_registry.get_cfgs()` 会拿到训练配置；
-- `make_wmp_runner()` 内部可以根据 `train_cfg.runner.training_mode` 分发 runner；
-- 不会立刻撞上 `helpers.py` 和 `WMPRunner._build_world_model()` 的双重参数解析问题。
+### 4.3 AMP 放在哪里
 
-第二阶段再补命令行切换，届时需要同时改三处：
+第一版保留 AMP，但放在 real rollout / auxiliary side：
 
-1. 在 [legged_gym/utils/helpers.py:155-185](../legged_gym/utils/helpers.py#L155-L185) 中新增 `--training_mode`；
-2. 在 [legged_gym/utils/helpers.py:130-153](../legged_gym/utils/helpers.py#L130-L153) 中把它写回 `cfg_train.runner.training_mode`；
-3. 重构 [rsl_rl/runners/wmp_runner.py:142-168](../rsl_rl/runners/wmp_runner.py#L142-L168) 的 world model 配置构建方式，避免它再次对未知参数报错。
+- AMP 继续基于真实 `amp_obs` 与 `next_amp_obs` 计算；
+- 不把当前 AMP 判别器输出直接当 imagined reward；
+- 如果以后要进入 imagination，需要单独设计 latent-compatible motion prior。
 
-### 7.3 world model 参数链路必须一起改
+当前 AMP reward 的实现位置：
 
-这一点是评审意见里最关键的补充，应该明确写进方案。
+- [rsl_rl/algorithms/amp_discriminator.py:86-99](../rsl_rl/algorithms/amp_discriminator.py#L86-L99)
+- [rsl_rl/runners/wmp_runner.py:317-324](../rsl_rl/runners/wmp_runner.py#L317-L324)
 
-当前 `_build_world_model()` 里直接读取 `dreamer/configs.yaml`，然后又从 `sys.argv` 构造 parser 并 `parse_args()`。这意味着：
+### 4.4 privileged critic 放在哪里
 
-- CLI 参数不是统一从训练入口一路传递下来的；
-- runner 内部又复制了一套参数解释逻辑；
-- 未来只要在训练入口新增参数，就有机会在 world model 构建阶段再次报错。
+第一版主 critic 定义为 `latent critic`。
 
-因此推荐把 world model 配置读取改成下面结构：
+`privileged critic` 如果保留，只允许出现在：
 
-1. `helpers.py` 负责解析 CLI；
-2. `update_cfg_from_args()` 负责把训练相关参数写回 train cfg；
-3. `WMPRunner` / `DreamerRunner` 不再直接读 `sys.argv`；
-4. world model 所需参数通过显式 config dict 传入 `_build_world_model()`。
+- real rollout supervision；
+- posterior 对齐点；
+- bootstrap；
+- auxiliary value support。
 
-也就是说，后续的正确方向不是“给 `_build_world_model()` 再补几个参数”，而是**去掉 runner 内部的二次命令行解析**。
-
-### 7.4 推荐的一键切换落地顺序
-
-#### 第一阶段
-
-只支持配置文件切换：
-
-- `training_mode = 'wmp'`
-- `training_mode = 'dreamerv3'`
-
-#### 第二阶段
-
-再补命令行切换：
-
-```bash
-python legged_gym/scripts/train.py --task a1 --training_mode wmp
-python legged_gym/scripts/train.py --task a1 --training_mode dreamerv3
-```
-
-这样文档和实现可以保持一致，不会出现“文档上能一键切换，代码里实际还不支持”的误导。
+不能把它解释成 imagined future 上仍可直接消费真实 privileged observation 的主 critic。
 
 ---
 
-## 8. 具体修改建议（修正版）
+## 5. replay 与时间语义
 
-### 8.1 可以复用的现有模块
+### 5.1 第一版为什么沿用 chunk-step
 
-下面这些模块可以复用，但需要重新定义它们在 DreamerV3 路线中的职责：
+当前 world model 数据流已经按 `wm_update_interval` 组织：
 
-- [dreamer/models.py](../dreamer/models.py) 中 `WorldModel` 主体；
-- [dreamer/networks.py](../dreamer/networks.py) 中 RSSM 与 `imagine_with_action`；
-- [dreamer/tools.py:717-743](../dreamer/tools.py#L717-L743) 中 `lambda_return()`；
-- [rsl_rl/runners/wmp_runner.py:384-477](../rsl_rl/runners/wmp_runner.py#L384-L477) 中可参考的数据采样框架。
+- 一个 world-model-step 对应多个 env-step；
+- action 使用拼接块；
+- reward 使用窗口累计。
 
-注意，这里只能说“部分结构可参考或复用”，不能再表述成“当前 world model dataset / sampling 逻辑可直接复用”。
+关键位置：
 
-### 8.2 不能乐观假设直接复用的部分
+- [rsl_rl/runners/wmp_runner.py:228-315](../rsl_rl/runners/wmp_runner.py#L228-L315)
+- [rsl_rl/runners/wmp_runner.py:384-477](../rsl_rl/runners/wmp_runner.py#L384-L477)
 
-#### 1. reward / continuation 头当前并没有准备好
+因此第一版 `Dreamer Branch` 推荐继续沿用 chunk-step 语义，而不是立即改写成逐 env-step replay。
 
-评审意见是对的，这里不是“补个 cont_head”这么轻。
+### 5.2 这意味着什么
 
-当前状态：
+第一版应统一按下面语义理解：
 
-- `cont_head` 在 [dreamer/models.py:81-92](../dreamer/models.py#L81-L92) 整段被注释；
-- `reward_head` 虽然定义了，但 [dreamer/configs.yaml:34-35](../dreamer/configs.yaml#L34-L35) 里 `loss_scale: 0.0`；
-- 在 [dreamer/models.py:110-115](../dreamer/models.py#L110-L115) 中，reward loss 也确实由这个 scale 控制。
+- horizon 按 chunk-step 计；
+- discount 按 chunk-step 定义；
+- lambda return 按 chunk-step 定义；
+- imagined rollout 的时间尺度与 world-model-step 对齐。
 
-这意味着：
+这条路线不是标准逐步 Dreamer replay，而是本项目现有数据语义上的 Dreamer-style behavior branch。
 
-- 当前 reward head 默认并没有被真正训练成 Dreamer behavior 可依赖的 reward predictor；
-- continuation head 也没有进入训练闭环；
-- 所以 DreamerV3 行为学习最依赖的两个头都需要重新设计、启用并验证。
+---
 
-因此方案应修正为：
+## 6. 需要新增什么
 
-1. 补齐 `cont_head`；
-2. 重新定义 `reward_head` 的训练目标和 loss scale；
-3. 验证 reward / cont 预测质量之后，才能接 Dreamer actor / critic。
+### 6.1 推荐新增模块
 
-#### 2. 现有 WMP dataset 不是 Dreamer 常规 replay
-
-当前 [rsl_rl/runners/wmp_runner.py:228-315](../rsl_rl/runners/wmp_runner.py#L228-L315) 里的 world model 数据流有两个重要特征：
-
-- action 不是逐 env-step 存，而是 `wm_update_interval` 窗口内展平后的动作块；
-- reward 也是窗口内累加后的聚合 reward，而不是逐步 reward。
-
-此外视觉部分还有特殊语义：
-
-- 只有 camera 子集 env 使用真实深度；
-- 其它 env 的 `image` 由 depth predictor 生成；
-- 见 [rsl_rl/runners/wmp_runner.py:293-302](../rsl_rl/runners/wmp_runner.py#L293-L302)。
-
-所以这套数据更像：
-
-> WMP 专用的 world-model 训练集，而不是 DreamerV3 行为学习可直接复用的 replay buffer。
-
-因此文档方案应改成：
-
-- world model 训练数据流可以局部参考；
-- DreamerV3 behavior learning 需要重新定义 replay 语义；
-- 至少要明确是继续使用 chunked transition，还是新增逐 model-step replay；
-- 不能默认拿当前 dataset 直接接 imagined actor / critic。
-
-#### 3. actor / critic 的可观测性假设需要彻底分叉
-
-这不是只新建一个 `DreamerActorCritic` 就完事。
-
-当前 [rsl_rl/modules/actor_critic_wmp.py:73-74](../rsl_rl/modules/actor_critic_wmp.py#L73-L74) 中：
-
-- actor 输入是 `history latent + command + wm_latent`；
-- critic 输入是 `num_critic_obs + wm_latent`。
-
-而 [rsl_rl/modules/actor_critic_wmp.py:214-220](../rsl_rl/modules/actor_critic_wmp.py#L214-L220) 明确表明 critic 直接吃的是环境侧 `critic_observations`。在当前任务里这条路径与 privileged observation 强绑定。
-
-DreamerV3 路线则应满足：
-
-- actor 在 posterior / prior latent feature 上工作；
-- critic 也主要基于 latent feature 估值；
-- imagined rollout 期间不能继续依赖真实环境里的 privileged critic 路径。
-
-因此这里不是“重写一个类名”的问题，而是**训练可观测性假设完全不同，必须独立分叉**。
-
-### 8.3 建议新增的模块
-
-基于上面的修正，建议新增：
+建议新增：
 
 1. `DreamerRunner`
-   - 负责 real rollout、world model 更新、behavior update、checkpoint 管理；
+   - 负责 real rollout、world model update、behavior update、checkpoint 管理。
 2. `DreamerBehavior`
-   - 负责 imagined rollout、actor / critic / slow target critic 更新；
+   - 负责 imagined rollout、actor / latent critic / slow target critic 更新。
 3. `DreamerReplay`
-   - 单独定义 DreamerV3 需要的数据语义，而不是直接复用 WMP dataset；
-4. `DreamerActorCritic` 或等价 latent behavior 模块
-   - 明确只服务于 latent imagination 路径；
+   - 单独定义 `Dreamer Branch` 的 replay 语义。
+4. `DreamerActorCritic`
+   - 明确服务于 latent imagination 路径。
 5. `cont_head`
-   - continuation / discount 建模头；
+   - continuation / discount 建模头。
 6. `DreamerCheckpointIO`
-   - 如果不想污染原 `save/load` 逻辑，可单独管理 Dreamer 模式附加状态。
+   - 管理 Dreamer 分支额外训练状态。
 
-### 8.4 不建议直接修改的点
+### 6.2 可以复用什么
 
-不建议做以下事情：
+可以优先复用：
 
-1. 在 [rsl_rl/algorithms/amp_ppo.py](../rsl_rl/algorithms/amp_ppo.py) 里硬塞 Dreamer 分支；
-2. 在 [rsl_rl/modules/actor_critic_wmp.py](../rsl_rl/modules/actor_critic_wmp.py) 里同时兼容 PPO actor 和 latent imagination actor；
-3. 让一个 runner 同时承担 WMP 与 DreamerV3 的所有内部细节；
-4. 继续保留 runner 内部对 `sys.argv` 的二次解析；
-5. 直接把当前 WMP dataset 当成 Dreamer replay 使用；
-6. 默认假设未来可以轻松把 AMP reward 接到 imagined rollout 里。
+- `WorldModel` 主体
+  [dreamer/models.py](../dreamer/models.py)
+- RSSM 与 latent rollout
+  [dreamer/networks.py](../dreamer/networks.py)
+- `lambda_return()`
+  [dreamer/tools.py:717-743](../dreamer/tools.py#L717-L743)
 
----
+### 6.3 不应直接复用什么
 
-## 9. 风险分析（修正版）
+不应乐观假设直接复用：
 
-### 9.1 算法风险
+- 当前 WMP dataset 作为 Dreamer replay；
+- 当前 `ActorCriticWMP` 作为 imagined actor / critic；
+- 当前 `AMPPPO` 作为 Dreamer behavior learner；
+- 当前 reward / continuation 头配置直接满足行为学习。
 
-腿足控制比很多标准 Dreamer benchmark 更敏感，主要体现在：
+其中 world model 当前还存在两个关键缺口：
 
-- imagination horizon 更难选；
-- action repeat 与控制频率耦合更强；
-- reward 尺度更容易导致 value 不稳定；
-- latent rollout 误差积累更快。
-
-### 9.2 world model 目标风险
-
-这是这次评审补充后必须单列的一项。
-
-DreamerV3 行为学习依赖：
-
-- reward predictor；
-- continuation predictor；
-- 可用于 imagination 的 latent dynamics。
-
-而当前实现中：
-
-- `reward_head` 默认未有效训练；
-- `cont_head` 没启用；
-- dataset 语义是 WMP 专用 chunk 形式。
-
-因此不能默认当前 world model 已满足 Dreamer behavior 的前提条件，必须先完成 world model 训练目标重构。
-
-### 9.3 系统风险
-
-当前 WMP 可能部分依赖 AMP 运动先验来保证 gait quality。
-
-如果直接切成纯 DreamerV3：
-
-- reward 可能上升更慢；
-- gait 可能不自然；
-- 早期训练稳定性可能下降。
-
-### 9.4 视觉风险
-
-当前视觉链路里还有 depth predictor，见：
-
-- [rsl_rl/runners/wmp_runner.py:419-438](../rsl_rl/runners/wmp_runner.py#L419-L438)
-- [rsl_rl/runners/wmp_runner.py:440-477](../rsl_rl/runners/wmp_runner.py#L440-L477)
-
-如果 DreamerV3 模式完全依赖 imagined latent，视觉预测误差会更直接传递到策略学习里。
-
-### 9.5 checkpoint 风险
-
-文档之前写“保存/恢复接口尽量一致”，这句话需要收紧。
-
-当前 WMP checkpoint 只保存：
-
-- actor_critic；
-- actor optimizer；
-- world model；
-- world model optimizer；
-- depth predictor；
-
-见 [rsl_rl/runners/wmp_runner.py:558-569](../rsl_rl/runners/wmp_runner.py#L558-L569)。
-
-如果新增 DreamerV3 路线，通常还需要保存：
-
-- Dreamer replay 的必要状态；
-- behavior actor / critic；
-- slow target critic；
-- 它们各自的 optimizer；
-- 可能还包括行为训练相关计数器。
-
-因此更准确的说法应该是：
-
-- `save()` / `load()` 接口名可以尽量保持一致；
-- 但 checkpoint schema 需要为 Dreamer 模式单独扩展，不能假设和 WMP 完全共用。
-
-### 9.6 AMP 兼容风险
-
-文档之前提到“后续可把 AMP discriminator 当 auxiliary reward 接到 imagined return”，这句话也需要收紧。
-
-当前 AMP reward 依赖真实环境里的：
-
-- `amp_obs`
-- `next_amp_obs`
-
-计算位置见 [rsl_rl/runners/wmp_runner.py:317-323](../rsl_rl/runners/wmp_runner.py#L317-L323)。
-
-而 imagined latent rollout 中并没有天然对应的 `amp_obs -> next_amp_obs`。除非后续再定义：
-
-- 如何从 latent feature 解码出 AMP 判别器需要的状态；
-- 或如何构造一个可在 imagination 中计算的 motion prior reward；
-
-否则 AMP 不能被视为一个低成本的后续增强项。
-
-因此推荐修正为：
-
-- 第一版 DreamerV3 路线默认不接 AMP；
-- 是否重新引入 motion prior，作为后续独立课题评估。
+- `reward_head` 默认未有效训练：
+  [dreamer/configs.yaml:34-35](../dreamer/configs.yaml#L34-L35)
+- `cont_head` 仍未启用：
+  [dreamer/models.py:81-92](../dreamer/models.py#L81-L92)
 
 ---
 
-## 10. 推荐实施顺序（修正版）
+## 7. 不建议的实现方式
 
-为了不影响原体系，建议按下面顺序推进：
+不建议做下面这些事：
 
-### 第一步：拆参数链路和模式分发
+1. 在 [rsl_rl/algorithms/amp_ppo.py](../rsl_rl/algorithms/amp_ppo.py) 里硬塞 Dreamer 分支。
+2. 在 [rsl_rl/modules/actor_critic_wmp.py](../rsl_rl/modules/actor_critic_wmp.py) 里同时兼容 PPO actor 和 imagined actor。
+3. 让一个 runner 同时承担 WMP 与 DreamerV3 的所有内部细节。
+4. 继续依赖 runner 内部对 `sys.argv` 的二次解析。
+5. 把当前 AMP reward 不经改造直接接到 imagined return。
+6. 把 support-only privileged critic 重新变成 imagined phase 主 critic。
+7. 通过手工改代码、注释分支或改入口来切换 WMP 与 Dreamer Branch。
+
+---
+
+## 8. 实施顺序
+
+### 第一步：拆模式分发与参数链路
 
 目标：
 
-- 增加 `training_mode` 配置字段；
-- 先支持配置切换；
-- 去掉或绕开 runner 内部对 `sys.argv` 的二次解析；
-- 建立 `WMPRunner` / `DreamerRunner` 的模式分发框架；
-- 不改原 WMP 行为。
+- 增加 `training_mode`；
+- 先支持配置切换，再补命令行切换；
+- 让切回原版 WMP 只依赖 mode switch，而不是代码修改；
+- 去掉或绕开 world model 构造过程中的 `sys.argv` 二次解析；
+- 建立 `WMPRunner` / `DreamerRunner` 分发。
 
-### 第二步：单独重构 Dreamer world model 训练目标
+### 第二步：补齐 world model 行为学习前提
 
 目标：
 
 - 启用并验证 `reward_head`；
 - 实现并验证 `cont_head`；
-- 明确 Dreamer replay 的数据语义；
-- 验证 world model 预测质量达到行为学习可用水平。
+- 明确 Dreamer replay 的 chunk-step 语义；
+- 证明 world model 已达到 imagined behavior 可用水平。
 
-### 第三步：先做纯 proprioception 的 DreamerV3 baseline
-
-目标：
-
-- 先不接 camera / depth predictor；
-- 先验证 imagined actor / critic 闭环；
-- 去掉 privileged critic 假设；
-- 确保 loss 与 rollout 数值稳定。
-
-### 第四步：再接回视觉
+### 第三步：做第一版 hybrid Dreamer Branch baseline
 
 目标：
 
-- 重新定义视觉 world model 数据流是否沿用当前 WMP 方案；
-- 验证视觉输入下的训练稳定性；
-- 比较与原 WMP 的收益和代价。
+- 保留视觉链路；
+- 保留 AMP，但只放在 real rollout side；
+- 保留 privileged critic，但只做 support role；
+- imagined phase 只走 latent-path；
+- 主 critic 使用 latent critic；
+- 原版 WMP 路线保持可直接回切；
+- 先验证训练闭环数值稳定。
 
-### 第五步：最后再评估 motion prior / AMP
+### 第四步：做关键消融
 
-推荐先完全不混。
+建议至少比较：
 
-只有在 DreamerV3 baseline 已稳定后，再单独评估：
+- 有无 AMP；
+- latent critic only vs latent critic + privileged support；
+- 有无视觉链路；
+- `Dreamer Branch` vs 原 `WMP`。
 
-- 是否需要 motion prior；
-- 如果需要，应采用 latent-compatible 的新设计，还是为其单独解码出判别器输入。
+### 第五步：再考虑 motion prior 的 imagination 化
 
----
+只有在第一版稳定之后，再评估是否需要：
 
-## 11. 最终建议（修正版）
-
-如果目标是：
-
-- **保留原 WMP**；
-- **同时新增 DreamerV3 版本**；
-- **最终支持一键切换**；
-- **不影响已有实验和训练流程**；
-
-那么最合适的方案是：
-
-1. 保留原 `WMPRunner + AMPPPO + ActorCriticWMP`；
-2. 新增 `DreamerRunner + DreamerBehavior + DreamerReplay (+ DreamerActorCritic)`；
-3. 复用 world model 主体、RSSM 和 `lambda_return()`，但**不默认复用**当前 WMP 的 reward/cont 头配置、dataset 语义和 privileged critic 假设；
-4. 在配置层先支持 `training_mode`，命令行切换放到参数链路重构之后；
-5. 单独扩展 Dreamer 模式的 checkpoint schema；
-6. 第一版 DreamerV3 路线默认不接 AMP。
-
-这是当前信息下最稳妥、最不容易误导实现成本的方案。
+- latent-space motion prior；
+- latent 解码到 AMP 特征；
+- 或其他 imagined imitation 设计。
 
 ---
 
-## 12. 已确认的设计选择
+## 9. 风险
 
-根据当前讨论，方案已经收敛为下面 5 点：
+### 9.1 算法风险
 
-1. `training_mode` **第一版就要支持 CLI 切换**；
-2. Dreamer replay **第一版沿用当前 `wm_update_interval` 的 chunk 语义**，不立即改成逐 env-step / 逐 model-step replay；
-3. 第一版 DreamerV3 **保留视觉链路**；
-4. 第一版 DreamerV3 **保留 AMP / motion prior**；
-5. checkpoint **允许为 Dreamer 模式扩展 schema**，不要求和 WMP 完全同构。
+腿足控制上的 Dreamer-style behavior learning 比标准 benchmark 更敏感：
 
-### 12.1 对第 2 点的具体解释
+- horizon 难选；
+- reward 尺度更敏感；
+- latent rollout 更易积累误差；
+- value 更容易不稳定。
 
-这里的“沿用 chunk 语义”指的是：
+### 9.2 world model 风险
 
-- 一个 world model step 继续对应 `wm_update_interval` 个 env step；
-- action 继续采用当前实现中的动作块拼接形式；
-- reward 继续采用当前实现中的窗口累计形式；
-- DreamerV3 第一版的 imagined rollout、horizon、discount、lambda 也都基于这个 chunk-level time scale 定义。
+当前 world model 还不是现成可用的 Dreamer behavior model：
 
-相关代码位置见：
+- reward 训练默认不足；
+- continuation 未启用；
+- replay 语义不是标准逐步版本。
 
-- [rsl_rl/runners/wmp_runner.py:228-315](../rsl_rl/runners/wmp_runner.py#L228-L315)
+### 9.3 系统耦合风险
 
-这样做的原因是：
+第一版保留视觉、AMP 和 privileged support，会降低“彻底换范式”的风险，但会提高系统复杂度：
 
-1. 与当前 WMP 的视觉 world model 数据流兼容性最好；
-2. 不必在第一版同时重写 replay 语义、视觉链路和 motion prior；
-3. 更符合“不破坏原体系、可一键切换”的目标。
+- loss 来源更多；
+- 梯度边界更难维护；
+- 日志与调参维度明显增加。
 
-但这也意味着：
+### 9.4 checkpoint 风险
 
-- 这条 DreamerV3 路线在第一版不是标准逐步 replay 版本；
-- 后续分析 horizon、discount、return 时，都必须按 chunk-step 而不是 env-step 理解；
-- AMP / motion prior 若要保留，也必须按这个 chunk 时间尺度重新设计兼容方式。
+Dreamer 分支通常需要额外保存：
 
-### 12.2 由此带来的实现约束
+- replay 状态；
+- behavior actor / latent critic；
+- slow target critic；
+- 对应 optimizer；
+- 训练计数器。
 
-既然第 2 点已经选定为 chunk 语义，那么后续实现里应明确遵守：
-
-1. 不新增第二套逐步 replay 作为第一版基础；
-2. `DreamerRunner` 的 real-data 收集逻辑优先复用当前 world model 的 chunk 采样节奏；
-3. actor / critic 的 imagined rollout 时间尺度与当前 world model step 对齐；
-4. 文档和代码中都要明确区分：
-   - env-step
-   - chunk-step / world-model-step
-
-避免后面在 reward、cont、discount、lambda 上出现语义混乱。
+因此 checkpoint schema 应允许独立扩展，而不应强求与 WMP 完全同构。
 
 ---
 
-## 13. 一句话总结
+## 10. 一句话结论
 
-**当前 WMP 是“world model 辅助 PPO/AMP 控制器”，而 DreamerV3 是“在 world model 的 imagination 中直接训练 actor/critic”。**
+**本项目最合适的方向，不是把当前 WMP 改写成 DreamerV3，而是保留 WMP 主线，新增一条以 chunk-step replay 为基础、以 latent critic 为主、且把 AMP / privileged critic 限制在 imagined phase 之外的 hybrid Dreamer Branch。**
 
-因此，当前确定的改法是：
+---
 
-**保留原 WMP 为 `wmp` 模式，新增 DreamerV3 为 `dreamerv3` 模式；第一版支持 CLI 切换，沿用当前 chunk-level world model 时间尺度，并允许为视觉、AMP / motion prior 与 checkpoint 做独立扩展。**
+## 11. 第一版最小实现清单
+
+### 11.1 总体原则
+
+第一版实现必须同时满足两个目标：
+
+1. `Dreamer Branch` 能独立演进；
+2. 原版 `WMP` 能通过显式 mode switch 立即切回。
+
+因此默认策略是：
+
+- 不同训练范式尽量分文件、分 runner、分模块；
+- 共享基础设施才放在一起；
+- 如果必须写在同一文件，必须有显式开关。
+
+不接受的切换方式：
+
+- 手工注释代码；
+- 手工改 import；
+- 手工改训练入口；
+- 手工删分支。
+
+### 11.2 文件级最小改动
+
+1. 训练入口分发
+   - [legged_gym/scripts/train.py](../legged_gym/scripts/train.py)
+   - [legged_gym/utils/task_registry.py](../legged_gym/utils/task_registry.py)
+   - 增加 `training_mode`
+   - 统一按 mode switch 分发到 `WMPRunner` 或 `DreamerRunner`
+   - 不再把训练入口硬编码到 `make_wmp_runner()`
+
+2. 配置层
+   - [legged_gym/envs/a1/a1_amp_config.py](../legged_gym/envs/a1/a1_amp_config.py)
+   - [legged_gym/envs/base/legged_robot_config.py](../legged_gym/envs/base/legged_robot_config.py)
+   - 新增 `training_mode`
+   - 新增 Dreamer 分支专用配置块
+   - 明确 `use_amp_aux`、`use_privileged_bootstrap`、`use_camera`
+
+3. 新增 `DreamerRunner`
+   - `rsl_rl/runners/dreamer_runner.py`
+   - 负责 real rollout、world model update、behavior update、checkpoint
+   - 不修改 `WMPRunner` 的原始训练闭环
+
+4. 新增 `DreamerReplay`
+   - `rsl_rl/storage/dreamer_replay.py`
+   - 独立承载 chunk-step replay 语义
+   - 不把现有 `wm_dataset` 直接改造成两用结构
+
+5. 补齐 world model 行为学习目标
+   - [dreamer/models.py](../dreamer/models.py)
+   - [dreamer/configs.yaml](../dreamer/configs.yaml)
+   - 启用 `reward_head`
+   - 实现 `cont_head`
+   - 这部分如果写在现有文件里，必须用显式配置控制，不得影响原 WMP 默认行为
+
+6. 新增 `DreamerBehavior`
+   - `rsl_rl/algorithms/dreamer_behavior.py`
+   - imagined rollout
+   - actor / latent critic / slow critic update
+   - 不混入 `AMPPPO`
+
+7. 新增 `DreamerActorCritic`
+   - `rsl_rl/modules/dreamer_actor_critic.py`
+   - actor 与主 critic 都吃 latent feature
+   - 不改造现有 `ActorCriticWMP` 去兼容两套主路径
+
+8. 保留 privileged support
+   - 优先放在 `DreamerRunner` real-side 逻辑
+   - 明确只做 bootstrap / auxiliary support
+   - 如果和 latent critic 同文件存在，必须显式区分主路径与 support 路径
+
+9. 保留 AMP auxiliary
+   - 优先复用当前 `AMPDiscriminator`
+   - 保持 real transition 训练链路
+   - imagined phase 不消费 AMP reward
+
+10. checkpoint
+   - Dreamer 分支允许单独 schema
+   - 不强求与 `WMPRunner` 完全同构
+
+### 11.3 哪些地方可以共用，哪些地方不要混
+
+可以共用：
+
+- world model 主体；
+- RSSM；
+- `lambda_return()`；
+- 公共日志工具；
+- checkpoint 辅助工具；
+- mode switch 分发入口。
+
+不要混在一起：
+
+- `WMPRunner` 与 `DreamerRunner` 主循环；
+- `AMPPPO` 与 `DreamerBehavior`；
+- `ActorCriticWMP` 与 `DreamerActorCritic`；
+- WMP rollout storage 与 Dreamer replay 语义。
+
+### 11.4 如果必须写在一起，必须有的开关
+
+如果某些代码必须留在同一文件，至少要有显式开关：
+
+- `training_mode == "wmp"`
+- `training_mode == "dreamerv3"`
+
+必要时再细分：
+
+- `use_amp_aux`
+- `use_privileged_bootstrap`
+- `use_camera`
+
+原则是：
+
+- 开关决定行为；
+- 不是注释决定行为；
+- 不是改代码决定行为。
