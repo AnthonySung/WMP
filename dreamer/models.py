@@ -194,7 +194,7 @@ class WorldModel(nn.Module):
         assert "is_first" in obs
         # 'is_terminal' is necesarry to train cont_head
         if "is_terminal" in obs:
-            obs["cont"] = (1.0 - obs["is_terminal"]).float()
+            obs["cont"] = (1.0 - obs["is_terminal"]).float().unsqueeze(-1)
         obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
         return obs
 
