@@ -47,15 +47,6 @@ from .helpers import get_args, update_cfg_from_args, class_to_dict, get_load_pat
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
 
 
-def dict_to_namespace(d):
-    """Recursively convert dict to argparse.Namespace."""
-    from argparse import Namespace
-    for key, value in d.items():
-        if isinstance(value, dict):
-            d[key] = dict_to_namespace(value)
-    return Namespace(**d)
-
-
 def load_wm_config(args=None, wm_device_override=None, num_actions_multiplier=1):
     """Load world model config from YAML, optionally override with CLI args.
 
@@ -65,7 +56,7 @@ def load_wm_config(args=None, wm_device_override=None, num_actions_multiplier=1)
         num_actions_multiplier: Multiply num_actions by this factor (for chunk-step).
 
     Returns:
-        argparse.Namespace with WM config.
+        argparse.Namespace with WM config (top-level only; nested configs are dicts).
     """
     wm_config_path = pathlib.Path(LEGGED_GYM_ROOT_DIR) / "dreamer/configs.yaml"
     configs = yaml.safe_load(wm_config_path.read_text())
@@ -81,9 +72,9 @@ def load_wm_config(args=None, wm_device_override=None, num_actions_multiplier=1)
     for name in ["defaults"]:
         recursive_update(defaults, configs[name])
 
-    # Build a simple namespace from defaults
+    # Build namespace from defaults (top-level only; nested remain dicts)
     from argparse import Namespace
-    wm_config = dict_to_namespace(defaults)
+    wm_config = Namespace(**defaults)
 
     # Override with CLI args if provided
     if args is not None:

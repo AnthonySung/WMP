@@ -39,7 +39,8 @@ class DreamerBehavior:
         self._imagined_horizon = getattr(config, 'imagined_horizon', 16)
         self._discount = getattr(config, 'discount', 0.997)
         self._lambda = getattr(config, 'lambda_return', 0.95)
-        self._entropy_scale = config.actor.entropy if hasattr(config.actor, 'entropy') else 3e-4
+        actor_cfg = config.actor if hasattr(config, 'actor') else config['actor']
+        self._entropy_scale = actor_cfg.get('entropy', 3e-4) if isinstance(actor_cfg, dict) else getattr(actor_cfg, 'entropy', 3e-4)
 
     def imagine_trajectory(self, post_state, horizon=None):
         """Perform imagined rollout from a posterior state.

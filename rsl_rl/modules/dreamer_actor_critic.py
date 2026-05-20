@@ -39,22 +39,31 @@ class DreamerActorCritic(nn.Module):
         self._feat_size = feat_size
         self._num_actions = num_actions
 
+        # Helper: config sub-dicts may be dict or Namespace
+        def _get(cfg, key, default=None):
+            if isinstance(cfg, dict):
+                return cfg.get(key, default)
+            return getattr(cfg, key, default)
+
+        actor_cfg = config.actor if hasattr(config, 'actor') else config['actor']
+        critic_cfg = config.critic if hasattr(config, 'critic') else config['critic']
+
         # --- Actor ---
         self.actor = networks.MLP(
             feat_size,
             (num_actions,),
-            config.actor.layers,
+            _get(actor_cfg, 'layers'),
             config.units,
             config.act,
             config.norm,
-            dist=config.actor.dist,
-            std=config.actor.std,
-            min_std=config.actor.min_std,
-            max_std=config.actor.max_std,
+            dist=_get(actor_cfg, 'dist'),
+            std=_get(actor_cfg, 'std'),
+            min_std=_get(actor_cfg, 'min_std'),
+            max_std=_get(actor_cfg, 'max_std'),
             absmax=1.0,
-            temp=config.actor.temp,
-            unimix_ratio=config.actor.unimix_ratio,
-            outscale=config.actor.outscale,
+            temp=_get(actor_cfg, 'temp'),
+            unimix_ratio=_get(actor_cfg, 'unimix_ratio'),
+            outscale=_get(actor_cfg, 'outscale'),
             device=config.device,
             name="Actor",
         )
@@ -63,34 +72,34 @@ class DreamerActorCritic(nn.Module):
         self.critic = networks.MLP(
             feat_size,
             (255,),  # symlog_disc uses 255 bins
-            config.critic.layers,
+            _get(critic_cfg, 'layers'),
             config.units,
             config.act,
             config.norm,
-            dist=config.critic.dist,
-            outscale=config.critic.outscale,
+            dist=_get(critic_cfg, 'dist'),
+            outscale=_get(critic_cfg, 'outscale'),
             device=config.device,
             name="Critic",
         )
 
         # --- Slow Target Critic ---
-        if config.critic.slow_target:
+        if _get(critic_cfg, 'slow_target'):
             self.slow_critic = networks.MLP(
                 feat_size,
                 (255,),
-                config.critic.layers,
+                _get(critic_cfg, 'layers'),
                 config.units,
                 config.act,
                 config.norm,
-                dist=config.critic.dist,
-                outscale=config.critic.outscale,
+                dist=_get(critic_cfg, 'dist'),
+                outscale=_get(critic_cfg, 'outscale'),
                 device=config.device,
                 name="SlowCritic",
             )
             # Initialize slow critic with same weights
             self.slow_critic.load_state_dict(self.critic.state_dict())
-            self._slow_target_update = config.critic.slow_target_update
-            self._slow_target_fraction = config.critic.slow_target_fraction
+            self._slow_target_update = _get(critic_cfg, 'slow_target_update')
+            self._slow_target_fraction = _get(critic_cfg, 'slow_target_fraction')
         else:
             self.slow_critic = None
 
@@ -98,18 +107,18 @@ class DreamerActorCritic(nn.Module):
         self.actor_opt = tools.Optimizer(
             "actor",
             self.actor.parameters(),
-            config.actor.lr,
-            config.actor.eps,
-            config.actor.grad_clip,
+            _get(actor_cfg, 'lr'),
+            _get(actor_cfg, 'eps'),
+            _get(actor_cfg, 'grad_clip'),
             opt="adam",
             use_amp=self._use_amp,
         )
         self.critic_opt = tools.Optimizer(
             "critic",
             self.critic.parameters(),
-            config.critic.lr,
-            config.critic.eps,
-            config.critic.grad_clip,
+            _get(critic_cfg, 'lr'),
+            _get(critic_cfg, 'eps'),
+            _get(critic_cfg, 'grad_clip'),
             opt="adam",
             use_amp=self._use_amp,
         )
