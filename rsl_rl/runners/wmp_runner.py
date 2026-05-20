@@ -472,6 +472,10 @@ class WMPRunner:
             is_first = torch.zeros((self.wm_config.batch_size, batch_length))
             is_first[:, 0] = 1
             batch_data["is_first"] = is_first
+            # Derive is_terminal from is_first: is_terminal[t] = is_first[t+1], last step is not terminal
+            is_terminal = torch.zeros((self.wm_config.batch_size, batch_length))
+            is_terminal[:, :-1] = is_first[:, 1:]
+            batch_data["is_terminal"] = is_terminal
             post, context, mets = self._world_model._train(batch_data)
         wm_metrics.update(mets)
         return wm_metrics
