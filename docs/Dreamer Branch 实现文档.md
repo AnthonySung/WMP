@@ -1,8 +1,9 @@
 # Dreamer Branch 实现文档
 
-> 版本：v1.0  
+> 版本：v1.1  
 > 日期：2026-05-20  
-> 基于：WMP 项目 master 分支，commit `b5954cf`
+> 基于：WMP 项目 master 分支，commit `c0e0956`
+> 状态：Dreamer Branch 已跑通（Iter 137+ 无 crash），待验证收敛
 
 ---
 
@@ -152,7 +153,7 @@ python legged_gym/scripts/train.py --task=a1_amp --training_mode dreamerv3 --hea
 |------|--------|------|
 | `--task` | `a1_amp` | 任务名称 |
 | `--training_mode` | `wmp` | `wmp` 或 `dreamerv3` |
-| `--use_camera` | `True` | 启用/关闭深度相机视觉链路 |
+| `--use_camera` | `False`（a1_amp_config） | 启用/关闭深度相机视觉链路。注意：当前 `a1_amp_config.py` 中 `depth.use_camera = False`，开启需先改配置 |
 | `--headless` | `False` | 无头模式（不渲染） |
 | `--sim_device` | `cuda:0` | 仿真设备 |
 | `--num_envs` | 配置文件值 | 并行环境数 |
@@ -161,18 +162,33 @@ python legged_gym/scripts/train.py --task=a1_amp --training_mode dreamerv3 --hea
 
 ### 4.3 实验矩阵（推荐运行组合）
 
+> **注意**：当前 `a1_amp_config.py` 中 `depth.use_camera = False`，以下命令均为无视觉模式。如需视觉实验，先改配置 `use_camera = True`。
+
 ```bash
-# 实验 1：WMP 原版（baseline）
+# 实验 1：WMP 原版（baseline，无视觉）
 python legged_gym/scripts/train.py --task=a1_amp --headless --sim_device=cuda:0
 
-# 实验 2：Dreamer Branch（有视觉）
+# 实验 2：Dreamer Branch（无视觉，当前默认配置）
 python legged_gym/scripts/train.py --task=a1_amp --training_mode dreamerv3 --headless --sim_device=cuda:0
 
-# 实验 3：Dreamer Branch（无视觉，纯 proprioception）
-python legged_gym/scripts/train.py --task=a1_amp --training_mode dreamerv3 --use_camera False --headless --sim_device=cuda:0
+# 实验 3：Dreamer Branch（有视觉，需先改 a1_amp_config.py 中 depth.use_camera = True）
+python legged_gym/scripts/train.py --task=a1_amp --training_mode dreamerv3 --headless --sim_device=cuda:0
 
-# 实验 4：WMP 原版（无视觉对照）
-python legged_gym/scripts/train.py --task=a1_amp --use_camera False --headless --sim_device=cuda:0
+# 实验 4：WMP 原版（有视觉对照，需先改 a1_amp_config.py 中 depth.use_camera = True）
+python legged_gym/scripts/train.py --task=a1_amp --headless --sim_device=cuda:0
+```
+
+### 4.4 快速验证命令（确认无 bug）
+
+```bash
+# 克隆并运行，观察是否能跑到 Iter 100+ 无 crash
+git clone https://github.com/AnthonySung/WMP.git
+cd WMP
+pip install -r requirements.txt
+python legged_gym/scripts/train.py --task=a1_amp --training_mode dreamerv3 --headless --sim_device=cuda:0
+
+# 预期：Iter 3-4 开始 train 时间 > 0，Iter 50+ 稳定无 crash
+# 日志格式：Iter N: collect=X.Xs, train=X.Xs, wm_data=XXXXX.X
 ```
 
 ---
@@ -239,9 +255,10 @@ GPU 显存: ___ GB
 
 1. **reward_head 刚启用**：`loss_scale` 从 0 改为 1，需要观察 reward prediction 是否收敛
 2. **cont_head 刚启用**：首次训练 continuation prediction，可能需要调 `loss_scale`
-3. **Dreamer actor 用于 real rollout**：当前 DreamerRunner 在 real rollout 中用 Dreamer actor（从 WM latent 采样），而非 PPO actor。这在 WM 训练早期可能不稳定
+3. **Dreamer actor 用于 real rollout**：当前 DreamerRunner 在 real rollout 中用 Dreamer actor（从 WM latent 采样），而非 PPO actor。actor 输出 60-dim chunk-step action，取前 12-dim 给 env 执行。WM 训练早期可能不稳定
 4. **无 privileged bootstrap**：当前 Dreamer Branch 的 latent critic 完全不走 privileged info，bootstrap 功能尚未实现
 5. **Chunk-step 语义**：imagined horizon=16 对应 80 env-steps ≈ 0.4s，可能偏短
+6. **Actor 每 env-step 都采样**：但 WM feature 每 5 env-steps 才更新一次，导致连续 5 步用相同 feature 采样相同 60-dim action（取同一 12-dim slice 重复执行）
 
 ### 6.2 如果训练不稳定
 
@@ -258,7 +275,7 @@ GPU 显存: ___ GB
 ### Phase 1：基础验证（当前阶段）
 
 - [x] WMP 原版 `use_camera=False` 训练验证 ✅
-- [ ] Dreamer Branch `use_camera=False` 训练验证
+- [x] Dreamer Branch `use_camera=False` 训练验证 ✅（Iter 137+ 无 crash，核心路径跑通）
 - [ ] Dreamer Branch `use_camera=True` 训练验证
 - [ ] 观察 reward_head / cont_head loss 收敛曲线
 - [ ] 对比 WMP vs Dreamer 的 reward 曲线
