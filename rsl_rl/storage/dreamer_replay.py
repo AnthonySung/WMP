@@ -121,13 +121,17 @@ class DreamerReplay:
             value = torch.stack(value)
             batch_data[k] = value
 
+        # Determine device from the first dataset tensor
+        first_key = next(iter(self._dataset))
+        device = self._dataset[first_key].device
+
         # is_first: first step of each sequence is always the start
-        is_first = torch.zeros((batch_size, batch_length))
+        is_first = torch.zeros((batch_size, batch_length), device=device)
         is_first[:, 0] = 1
         batch_data["is_first"] = is_first
 
         # is_terminal: derived from is_first (terminal[t] = is_first[t+1])
-        is_terminal = torch.zeros((batch_size, batch_length))
+        is_terminal = torch.zeros((batch_size, batch_length), device=device)
         is_terminal[:, :-1] = is_first[:, 1:]
         batch_data["is_terminal"] = is_terminal
 
