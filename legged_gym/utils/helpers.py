@@ -133,6 +133,9 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
+        # depth camera
+        if args.use_camera is not None:
+            env_cfg.depth.use_camera = args.use_camera
     if cfg_train is not None:
         if args.seed is not None:
             cfg_train.seed = args.seed
@@ -171,6 +174,7 @@ def get_args():
          "help": 'Only for play'},
         {"name": "--wm_device", "type": str, "default": "None", "help": 'World model device. Overrides config file in dreamer/config.yaml if provided'},
         {"name": "--training_mode", "type": str, "default": None, "help": "Training mode: 'wmp' or 'dreamerv3'. Overrides config file if provided."},
+        {"name": "--use_camera", "type": bool, "default": None, "help": "Enable/disable depth camera for world model. Overrides config file if provided."},
 
     ]
     # parse arguments
