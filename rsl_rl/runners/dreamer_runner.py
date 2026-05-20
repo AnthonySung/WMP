@@ -350,7 +350,7 @@ class DreamerRunner:
             )
 
         wm_action_history = torch.zeros(
-            (self.env.num_envs, self.wm_update_interval, self.env.num_actions),
+            (self.env.num_envs, self.wm_config.num_actions),
             device=self._world_model.device,
         )
         wm_reward = torch.zeros(self.env.num_envs, device=self._world_model.device)
@@ -377,8 +377,10 @@ class DreamerRunner:
                     actions = self._dreamer_ac.act(
                         wm_feature.to(self._world_model.device), eval_mode=False,
                     )
-                    # Map to env device
-                    actions_env = actions.to(self.device)
+                    # actions: (num_envs, wm_config.num_actions=60)
+                    # Reshape to (num_envs, wm_update_interval, env.num_actions) and take first step for env
+                    actions_reshaped = actions.view(self.env.num_envs, self.wm_update_interval, self.env.num_actions)
+                    actions_env = actions_reshaped[:, 0, :].to(self.device)
 
                     obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states = \
                         self.env.step(actions_env)
@@ -387,10 +389,8 @@ class DreamerRunner:
                     obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
                     next_amp_obs = next_amp_obs.to(self.device)
 
-                    # Update WM input
-                    wm_action_history = torch.concat(
-                        (wm_action_history[:, 1:], actions.unsqueeze(1).to(self._world_model.device)), dim=1,
-                    )
+                    # Update WM input: store full 60-dim action
+                    wm_action_history = actions.to(self._world_model.device)
                     wm_obs = {
                         "prop": obs[:, self.env.privileged_dim:self.env.privileged_dim + self.env.cfg.env.prop_dim].to(
                             self._world_model.device),
@@ -418,7 +418,7 @@ class DreamerRunner:
                         wm_action_history[reset_env_ids_np, :] = 0
                         wm_is_first[reset_env_ids_np] = 1
 
-                    wm_action = wm_action_history.flatten(1)
+                    wm_action = wm_action_history  # already (num_envs, wm_config.num_actions=60)
                     wm_reward += rewards.to(self._world_model.device)
 
                     # Store into buffer
