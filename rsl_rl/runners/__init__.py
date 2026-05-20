@@ -33,3 +33,4 @@
 
 from .on_policy_runner import OnPolicyRunner
 from .wmp_runner import WMPRunner
+from .dreamer_runner import DreamerRunner
