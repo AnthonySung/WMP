@@ -96,8 +96,9 @@ class DreamerActorCritic(nn.Module):
                 device=config.device,
                 name="SlowCritic",
             )
-            # Initialize slow critic with same weights
-            self.slow_critic.load_state_dict(self.critic.state_dict())
+            # Manually copy weights (MLP uses name as prefix, so state_dict keys differ)
+            for slow_param, param in zip(self.slow_critic.parameters(), self.critic.parameters()):
+                slow_param.data.copy_(param.data)
             self._slow_target_update = _get(critic_cfg, 'slow_target_update')
             self._slow_target_fraction = _get(critic_cfg, 'slow_target_fraction')
         else:
