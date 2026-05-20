@@ -320,6 +320,13 @@ class A1AMPCfgPPO(LeggedRobotCfgPPO):
         policy_class_name = 'ActorCritic'
         max_iterations = 20000  # number of policy updates
         save_interval = 1000
+        training_mode = 'wmp'  # 'wmp' or 'dreamerv3'
+
+        # Dreamer Branch specific settings (only used when training_mode == 'dreamerv3')
+        dreamer_imagined_horizon = 16  # imagined rollout length in chunk-steps
+        dreamer_use_amp_aux = True  # keep AMP on real rollout side
+        dreamer_use_privileged_bootstrap = True  # keep privileged critic for bootstrap
+        dreamer_use_camera = True  # keep visual pipeline
 
         amp_reward_coef = 0.5 * 0.02  # set to 0 means not use amp reward
         amp_motion_files = MOTION_FILES

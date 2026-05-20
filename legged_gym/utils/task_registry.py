@@ -259,7 +259,19 @@ class TaskRegistry():
         )
         train_cfg_dict["wm_config"] = wm_config
 
-        runner = WMPRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
+        # Mode switch: dispatch to WMPRunner or DreamerRunner
+        training_mode = getattr(train_cfg.runner, 'training_mode', 'wmp')
+        if training_mode == 'dreamerv3':
+            # DreamerRunner will be imported once created
+            try:
+                from rsl_rl.runners import DreamerRunner
+                runner = DreamerRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
+            except ImportError:
+                print("[WARNING] DreamerRunner not yet implemented, falling back to WMPRunner")
+                runner = WMPRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
+        else:
+            runner = WMPRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
+
         #save resume path before creating a new log_dir
         resume = train_cfg.runner.resume
         if resume:
