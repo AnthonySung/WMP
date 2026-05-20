@@ -47,6 +47,15 @@ from .helpers import get_args, update_cfg_from_args, class_to_dict, get_load_pat
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
 
 
+def dict_to_namespace(d):
+    """Recursively convert dict to argparse.Namespace."""
+    from argparse import Namespace
+    for key, value in d.items():
+        if isinstance(value, dict):
+            d[key] = dict_to_namespace(value)
+    return Namespace(**d)
+
+
 def load_wm_config(args=None, wm_device_override=None, num_actions_multiplier=1):
     """Load world model config from YAML, optionally override with CLI args.
 
@@ -74,7 +83,7 @@ def load_wm_config(args=None, wm_device_override=None, num_actions_multiplier=1)
 
     # Build a simple namespace from defaults
     from argparse import Namespace
-    wm_config = Namespace(**defaults)
+    wm_config = dict_to_namespace(defaults)
 
     # Override with CLI args if provided
     if args is not None:
