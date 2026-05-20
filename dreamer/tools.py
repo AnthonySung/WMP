@@ -708,9 +708,16 @@ def static_scan_for_lambda_return(fn, inputs, start):
             flag = False
         else:
             outputs = torch.cat([outputs, last], dim=-1)
-    outputs = torch.reshape(outputs, [outputs.shape[0], outputs.shape[1], 1])
-    outputs = torch.flip(outputs, [1])
-    outputs = torch.unbind(outputs, dim=0)
+    if outputs.dim() == 1:
+        # 1D case: (horizon * batch,) -> (horizon, batch)
+        batch_size = start.shape[0]
+        horizon = inputs[0].shape[0]
+        outputs = outputs.reshape(horizon, batch_size)
+        outputs = torch.flip(outputs, [0])  # flip time dim
+    else:
+        # 2D case: (batch, horizon) from cat along dim=-1
+        outputs = torch.reshape(outputs, [outputs.shape[0], outputs.shape[1]])
+        outputs = torch.flip(outputs, [1])  # flip time dim
     return outputs
 
 
