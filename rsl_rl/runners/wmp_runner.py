@@ -142,34 +142,38 @@ class WMPRunner:
     def _build_world_model(self):
         # world model
         print('Begin construct world model')
-        configs = yaml.safe_load(
-            (pathlib.Path(sys.argv[0]).parent.parent.parent / "dreamer/configs.yaml").read_text()
-        )
+        self.wm_config = self.cfg.get("wm_config")
+        if self.wm_config is None:
+            # Fallback: load from YAML directly (legacy path, will be removed)
+            configs = yaml.safe_load(
+                (pathlib.Path(sys.argv[0]).parent.parent.parent / "dreamer/configs.yaml").read_text()
+            )
 
-        def recursive_update(base, update):
-            for key, value in update.items():
-                if isinstance(value, dict) and key in base:
-                    recursive_update(base[key], value)
-                else:
-                    base[key] = value
+            def recursive_update(base, update):
+                for key, value in update.items():
+                    if isinstance(value, dict) and key in base:
+                        recursive_update(base[key], value)
+                    else:
+                        base[key] = value
 
-        name_list = ["defaults"]
-        defaults = {}
-        for name in name_list:
-            recursive_update(defaults, configs[name])
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--headless", action="store_true", default=False)
-        parser.add_argument("--sim_device", default='cuda:0')
-        parser.add_argument("--wm_device", default='None')
-        parser.add_argument("--terrain", default='climb')
-        for key, value in sorted(defaults.items(), key=lambda x: x[0]):
-            arg_type = tools.args_type(value)
-            parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
-        self.wm_config = parser.parse_args()
-        # allow world model and rl env on different device
-        if (self.wm_config.wm_device != 'None'):
-            self.wm_config.device = self.wm_config.wm_device
-        self.wm_config.num_actions = self.wm_config.num_actions * self.env.cfg.depth.update_interval
+            name_list = ["defaults"]
+            defaults = {}
+            for name in name_list:
+                recursive_update(defaults, configs[name])
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--headless", action="store_true", default=False)
+            parser.add_argument("--sim_device", default='cuda:0')
+            parser.add_argument("--wm_device", default='None')
+            parser.add_argument("--terrain", default='climb')
+            for key, value in sorted(defaults.items(), key=lambda x: x[0]):
+                arg_type = tools.args_type(value)
+                parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
+            self.wm_config = parser.parse_args()
+            # allow world model and rl env on different device
+            if (self.wm_config.wm_device != 'None'):
+                self.wm_config.device = self.wm_config.wm_device
+            self.wm_config.num_actions = self.wm_config.num_actions * self.env.cfg.depth.update_interval
+
         prop_dim = self.env.num_obs - self.env.privileged_dim - self.env.height_dim - self.env.num_actions
         image_shape = self.env.cfg.depth.resized + (1,)
         obs_shape = {'prop': (prop_dim,), 'image': image_shape,}

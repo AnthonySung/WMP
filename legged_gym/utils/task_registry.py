@@ -36,6 +36,8 @@ from datetime import datetime
 from typing import Tuple
 import torch
 import numpy as np
+import pathlib
+import ruamel.yaml as yaml
 
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner, WMPRunner
@@ -43,6 +45,50 @@ from rsl_rl.runners import OnPolicyRunner, WMPRunner
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 from .helpers import get_args, update_cfg_from_args, class_to_dict, get_load_path, set_seed, parse_sim_params
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
+
+
+def load_wm_config(args=None, wm_device_override=None, num_actions_multiplier=1):
+    """Load world model config from YAML, optionally override with CLI args.
+
+    Args:
+        args: CLI args object (from get_args()). If None, uses defaults.
+        wm_device_override: Override device for world model (e.g. 'cuda:1').
+        num_actions_multiplier: Multiply num_actions by this factor (for chunk-step).
+
+    Returns:
+        argparse.Namespace with WM config.
+    """
+    wm_config_path = LEGGED_GYM_ROOT_DIR / "dreamer/configs.yaml"
+    configs = yaml.safe_load(wm_config_path.read_text())
+
+    def recursive_update(base, update):
+        for key, value in update.items():
+            if isinstance(value, dict) and key in base:
+                recursive_update(base[key], value)
+            else:
+                base[key] = value
+
+    defaults = {}
+    for name in ["defaults"]:
+        recursive_update(defaults, configs[name])
+
+    # Build a simple namespace from defaults
+    from argparse import Namespace
+    wm_config = Namespace(**defaults)
+
+    # Override with CLI args if provided
+    if args is not None:
+        if hasattr(args, 'sim_device') and args.sim_device is not None:
+            wm_config.device = args.sim_device
+        if hasattr(args, 'headless'):
+            wm_config.headless = args.headless
+
+    if wm_device_override is not None:
+        wm_config.device = wm_device_override
+
+    wm_config.num_actions = wm_config.num_actions * num_actions_multiplier
+
+    return wm_config
 
 class TaskRegistry():
     def __init__(self):
@@ -204,6 +250,15 @@ class TaskRegistry():
             log_dir = os.path.join(log_root, train_cfg.runner.run_name)
         # print(train_cfg.runner_class_name)
         train_cfg_dict = class_to_dict(train_cfg)
+
+        # Load WM config and inject into train_cfg_dict
+        wm_config = load_wm_config(
+            args=args,
+            wm_device_override=getattr(args, 'wm_device', None) if getattr(args, 'wm_device', 'None') != 'None' else None,
+            num_actions_multiplier=env.cfg.depth.update_interval if hasattr(env, 'cfg') else 1,
+        )
+        train_cfg_dict["wm_config"] = wm_config
+
         runner = WMPRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
         #save resume path before creating a new log_dir
         resume = train_cfg.runner.resume
