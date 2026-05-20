@@ -49,6 +49,7 @@ class DreamerRunner:
                  device='cpu',
                  history_length=5,
                  ):
+        self.train_cfg = train_cfg  # keep full dict for wm_config access
         self.cfg = train_cfg["runner"]
         self.alg_cfg = train_cfg.get("algorithm", {})
         self.policy_cfg = train_cfg.get("policy", {})
@@ -133,7 +134,7 @@ class DreamerRunner:
     def _build_world_model(self):
         """Build world model from config (same as WMPRunner)."""
         print('Begin construct world model (Dreamer Branch)')
-        self.wm_config = self.cfg.get("wm_config")
+        self.wm_config = self.train_cfg.get("wm_config")
         if self.wm_config is None:
             raise ValueError("wm_config must be provided in train_cfg")
 
@@ -144,7 +145,10 @@ class DreamerRunner:
         self._world_model = WorldModel(self.wm_config, obs_shape, use_camera=self.env.cfg.depth.use_camera)
         self._world_model = self._world_model.to(self._world_model.device)
         print('Finish construct world model')
-        self.wm_feature_dim = self.wm_config.dyn_deter
+        if self.wm_config.dyn_discrete:
+            self.wm_feature_dim = self.wm_config.dyn_stoch * self.wm_config.dyn_discrete + self.wm_config.dyn_deter
+        else:
+            self.wm_feature_dim = self.wm_config.dyn_stoch + self.wm_config.dyn_deter
 
     # ------------------------------------------------------------------
     # Data collection (reuses WMPRunner's wm_dataset infrastructure)
@@ -366,7 +370,7 @@ class DreamerRunner:
                         wm_latent, _ = self._world_model.dynamics.obs_step(
                             wm_latent, wm_action, wm_embed, wm_obs["is_first"],
                         )
-                        wm_feature = self._world_model.dynamics.get_deter_feat(wm_latent)
+                        wm_feature = self._world_model.dynamics.get_feat(wm_latent)
                         wm_is_first[:] = 0
 
                     # Use Dreamer actor for action selection (from WM feature)
