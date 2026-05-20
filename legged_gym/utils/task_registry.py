@@ -58,7 +58,7 @@ def load_wm_config(args=None, wm_device_override=None, num_actions_multiplier=1)
     Returns:
         argparse.Namespace with WM config.
     """
-    wm_config_path = LEGGED_GYM_ROOT_DIR / "dreamer/configs.yaml"
+    wm_config_path = pathlib.Path(LEGGED_GYM_ROOT_DIR) / "dreamer/configs.yaml"
     configs = yaml.safe_load(wm_config_path.read_text())
 
     def recursive_update(base, update):

@@ -138,7 +138,7 @@ class A1AMPCfg(LeggedRobotCfg):
 
 
     class depth:
-        use_camera = True
+        use_camera = False
         camera_num_envs = 1024
         camera_terrain_num_rows = 10
         camera_terrain_num_cols = 20
