@@ -31,4 +31,5 @@
 from .actor_critic import ActorCritic
 from .actor_critic_wmp import ActorCriticWMP
 from .actor_critic_recurrent import ActorCriticRecurrent
+from .dreamer_actor_critic import DreamerActorCritic
 from .depth_predictor import DepthPredictor
