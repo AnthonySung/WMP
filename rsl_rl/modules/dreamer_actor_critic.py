@@ -111,6 +111,7 @@ class DreamerActorCritic(nn.Module):
             _get(actor_cfg, 'lr'),
             _get(actor_cfg, 'eps'),
             _get(actor_cfg, 'grad_clip'),
+            wd=0.0,
             opt="adam",
             use_amp=self._use_amp,
         )
@@ -120,6 +121,7 @@ class DreamerActorCritic(nn.Module):
             _get(critic_cfg, 'lr'),
             _get(critic_cfg, 'eps'),
             _get(critic_cfg, 'grad_clip'),
+            wd=0.0,
             opt="adam",
             use_amp=self._use_amp,
         )
