@@ -170,6 +170,7 @@ def get_args():
         {"name": "--terrain", "type": str, "default": "climb",
          "help": 'Only for play'},
         {"name": "--wm_device", "type": str, "default": "None", "help": 'World model device. Overrides config file in dreamer/config.yaml if provided'},
+        {"name": "--training_mode", "type": str, "default": None, "help": "Training mode: 'wmp' or 'dreamerv3'. Overrides config file if provided."},
 
     ]
     # parse arguments
