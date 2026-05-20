@@ -77,7 +77,7 @@ class DreamerRunner:
             feat_size = self.wm_config.dyn_stoch + self.wm_config.dyn_deter
 
         self._dreamer_ac = DreamerActorCritic(
-            self.wm_config, feat_size, self.env.num_actions,
+            self.wm_config, feat_size, self.wm_config.num_actions,
             use_amp=(self.wm_config.precision == 16),
         )
         self._dreamer_ac.to(self._world_model.device)
