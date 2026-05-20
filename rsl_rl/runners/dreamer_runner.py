@@ -206,6 +206,8 @@ class DreamerRunner:
 
     def train_depth_predictor(self):
         """Train depth predictor (same as WMPRunner)."""
+        if not self.env.cfg.depth.use_camera:
+            return 0.0
         total_mse_loss = 0
         dp_cfg = self.depth_predictor_cfg
         for _ in range(dp_cfg.get("training_iters", 1000)):

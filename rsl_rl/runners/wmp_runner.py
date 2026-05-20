@@ -421,6 +421,8 @@ class WMPRunner:
         self.wm_buffer_index = np.zeros(self.env.num_envs)
 
     def train_depth_predictor(self):
+        if not self.env.cfg.depth.use_camera:
+            return 0.0
         total_mse_loss = 0
         for _ in range(self.depth_predictor_cfg["training_iters"]):
             batch_idx = np.random.choice(self.env.depth_index_without_crawl_tilt, self.depth_predictor_cfg["batch_size"],
@@ -459,6 +461,8 @@ class WMPRunner:
                 value = []
                 for idx, end_idx in zip(batch_idx, batch_end_idx):
                     if (k == "image"):
+                        if not self.env.cfg.depth.use_camera:
+                            continue
                         idx_in_buffer = np.where(self.env.depth_index == idx)[0]
                         if (len(idx_in_buffer) == 0):
                             # not in the buffer, use the predicted ones
