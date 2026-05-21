@@ -42,6 +42,10 @@ defaults:
   unimix_ratio: 0.01
   initial: 'learned'
 
+  # Behavior learning
+  discount: 0.997
+  lambda_return: 0.95
+
   # Training
   train_steps_per_iter: 10
   train_start_steps: 10000

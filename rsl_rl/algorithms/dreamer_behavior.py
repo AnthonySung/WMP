@@ -51,16 +51,13 @@ class DreamerBehavior:
 
         Returns:
             feats: (horizon, batch, feat_size) latent features along trajectory.
-            states: (horizon, batch, ...) prior states along trajectory.
             actions: (horizon, batch, num_actions) actions taken.
+            final_state: Latent state after the final imagined transition.
         """
         horizon = horizon or self._imagined_horizon
-        batch_size = post_state["stoch"].shape[0]
-        device = post_state["stoch"].device
 
         state = {k: v for k, v in post_state.items()}
         feats = []
-        states = []
         actions = []
 
         for _ in range(horizon):
@@ -70,14 +67,13 @@ class DreamerBehavior:
             state = self._wm.dynamics.img_step(state, action, sample=True)
 
             feats.append(feat)
-            states.append(state)
             actions.append(action)
 
         # Stack along time dim: (horizon, batch, ...)
         feats = torch.stack(feats, dim=0)
         actions = torch.stack(actions, dim=0)
-        # states is a list of dicts; keep as list for now
-        return feats, states, actions
+        final_state = {k: v for k, v in state.items()}
+        return feats, actions, final_state
 
     def compute_imagined_rewards(self, feats):
         """Predict rewards from latent features.
@@ -126,22 +122,20 @@ class DreamerBehavior:
         values = values.reshape(feats.shape[0], feats.shape[1])
         return values
 
-    def compute_lambda_target(self, rewards, values, continuation):
+    def compute_lambda_target(self, rewards, values, continuation, bootstrap):
         """Compute lambda-return targets for value learning.
 
         Args:
             rewards: (horizon, batch) predicted rewards.
             values: (horizon, batch) predicted values (from slow critic).
             continuation: (horizon, batch) continuation probabilities.
+            bootstrap: (batch,) slow-critic value at the state after the horizon.
 
         Returns:
             lambda_target: (horizon, batch) lambda-return targets.
         """
         # pcont = discount * continuation
         pcont = self._discount * continuation
-
-        # Bootstrap: value of the step after horizon (zero if terminal)
-        bootstrap = torch.zeros_like(values[-1])
 
         lambda_target = tools.lambda_return(
             rewards, values, pcont, bootstrap, self._lambda, axis=0
@@ -192,7 +186,7 @@ class DreamerBehavior:
             metrics: dict of all training metrics.
         """
         # 1. Imagine trajectory
-        feats, states, actions = self.imagine_trajectory(post_state)
+        feats, actions, final_state = self.imagine_trajectory(post_state)
 
         # 2. Predict rewards and continuation
         rewards = self.compute_imagined_rewards(feats)
@@ -201,9 +195,14 @@ class DreamerBehavior:
         # 3. Compute values (slow critic for bootstrap)
         with torch.no_grad():
             slow_values = self.compute_value(feats, use_slow=True)
+            slow_bootstrap = self._ac.get_value(
+                self._wm.dynamics.get_feat(final_state), use_slow=True
+            ).reshape(feats.shape[1])
 
         # 4. Compute lambda-return targets
-        lambda_target = self.compute_lambda_target(rewards, slow_values, continuation)
+        lambda_target = self.compute_lambda_target(
+            rewards, slow_values, continuation, slow_bootstrap
+        )
 
         # 5. Compute advantages
         with torch.no_grad():
@@ -223,4 +222,6 @@ class DreamerBehavior:
         metrics = {}
         metrics.update(critic_metrics)
         metrics.update(actor_metrics)
+        metrics["imagined_reward"] = rewards.mean().detach().cpu().numpy()
+        metrics["imagined_value"] = slow_values.mean().detach().cpu().numpy()
         return metrics

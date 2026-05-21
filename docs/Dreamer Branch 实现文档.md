@@ -1,9 +1,9 @@
 # Dreamer Branch 实现文档
 
-> 版本：v1.1  
-> 日期：2026-05-20  
-> 基于：WMP 项目 master 分支，commit `c0e0956`
-> 状态：Dreamer Branch 已跑通（Iter 137+ 无 crash），待验证收敛
+> 版本：v1.3  
+> 日期：2026-05-21  
+> 基于：WMP 项目 master 分支  
+> 状态：核心路径已修正，全部已知小问题已修复，待在 Isaac Gym 环境下验证收敛
 
 ---
 
@@ -87,6 +87,10 @@ python legged_gym/scripts/train.py --task=a1_amp --training_mode wmp --headless 
 | `dreamer/configs.yaml` | reward_head loss_scale 0→1，grad_heads 加入 cont |
 | `dreamer/models.py` | 启用 cont_head，cont 张量 shape 修复 |
 | `rsl_rl/runners/wmp_runner.py` | WM config 去 sys.argv 化，is_terminal 推导，depth predictor guard |
+| `rsl_rl/runners/dreamer_runner.py` | 修正 chunk-step 动作执行语义，接入 AMP discriminator 训练 |
+| `rsl_rl/algorithms/dreamer_behavior.py` | 修正 imagined lambda-return 的 slow-critic bootstrap |
+| `rsl_rl/storage/dreamer_replay.py` | 补充 episode 尾部 is_terminal 标记 |
+| `legged_gym/tests/test_dreamer_behavior.py` | 新增纯 PyTorch 回归测试，锁定 imagined bootstrap 语义 |
 | `rsl_rl/modules/__init__.py` | 导出 DreamerActorCritic |
 | `rsl_rl/runners/__init__.py` | 导出 DreamerRunner |
 
@@ -100,27 +104,33 @@ python legged_gym/scripts/train.py --task=a1_amp --training_mode wmp --headless 
 
 ```
 1. Real Rollout（收集数据）
-   ├── Dreamer actor 从 WM latent feature 采样 action
-   ├── env.step() 执行动作
+   ├── 每个 chunk-step 起点由 Dreamer actor 从 WM latent feature 采样一整段 chunk action
+   ├── 在 chunk 内按顺序执行每个 env-step 对应的 action slice
    ├── WM obs_step 更新 latent state
-   ├── 写入 wm_dataset（chunk-step 粒度）
-   └── AMP discriminator 计算 reward（real side only）
+   ├── 将真实执行过的整段 chunk action 写入 wm_dataset（chunk-step 粒度）
+   └── AMP discriminator 在 real side 计算 reward
 
 2. World Model Training（在真实数据上）
    ├── DreamerReplay.sample_batch() 采样序列
    ├── WM._train()：encoder → RSSM → decoder/reward/cont heads
    └── 更新 WM optimizer
 
-3. Behavior Learning（在 latent 空间中）
+3. AMP Auxiliary Update（真实 transition 上）
+   ├── 收集 rollout 期间的 `amp_obs -> next_amp_obs`
+   ├── 更新独立的 AMP discriminator optimizer
+   └── 记录 AMP loss / grad penalty / policy pred / expert pred
+
+4. Behavior Learning（在 latent 空间中）
    ├── 从 replay batch 获取 posterior state
    ├── DreamerBehavior.update()：
    │   ├── imagine_trajectory()：RSSM img_step 展开 imagined rollout
    │   ├── 预测 imagined reward / continuation / value
-   │   ├── compute_lambda_target()：λ-return
+   │   ├── 用 final imagined state 的 slow critic 作为 λ-return bootstrap
+   │   ├── compute_lambda_target()：chunk-step λ-return
    │   ├── update_critic()：latent critic → λ-target
    │   ├── update_actor()：REINFORCE + entropy bonus
    │   └── update_slow_critic()：EMA
-   └── (可选) AMP discriminator 更新（real side）
+   └── 记录 imagined reward / imagined value 等行为学习指标
 ```
 
 ### 3.2 关键设计决策
@@ -130,8 +140,16 @@ python legged_gym/scripts/train.py --task=a1_amp --training_mode wmp --headless 
 | **Imagined phase 不走 privileged obs** | Actor/Critic 只消费 RSSM latent feature |
 | **AMP 仅 real side** | AMP discriminator 独立 optimizer，imagined reward 来自 WM reward_head |
 | **Chunk-step 时间语义** | 1 chunk-step = 5 env-steps（`wm_update_interval=5`），horizon 按 chunk-step 计 |
+| **Chunk action 与 dataset 对齐** | 每个 chunk-step 只采样一次整段动作，环境执行与 replay 写入保持一致 |
 | **Latent critic 为主 critic** | Symlog-discretized 分布，EMA slow target |
 | **视觉链路保留** | DepthPredictor 继续作为 WM 输入预处理器 |
+
+### 3.3 Replay 与 bootstrap 语义
+
+- `DreamerReplay.sample_batch()` 仍以当前 `wm_dataset` 的单 env-slot 单 episode 设计为基础。
+- 每个采样子序列的第一个时间步都标记为 `is_first=1`，表示该子序列从独立的 latent reset 开始。
+- 当采样窗口命中该 env slot 当前 episode 的尾部时，最后一个时间步会标记为 `is_terminal=1`，用于训练 `cont_head`。
+- `DreamerBehavior` 计算 λ-return 时，不再把 horizon 末端 bootstrap 强行置零，而是使用 final imagined state 的 slow critic value。
 
 ---
 
@@ -191,6 +209,17 @@ python legged_gym/scripts/train.py --task=a1_amp --training_mode dreamerv3 --hea
 # 日志格式：Iter N: collect=X.Xs, train=X.Xs, wm_data=XXXXX.X
 ```
 
+### 4.5 无 Isaac Gym 的逻辑回归测试
+
+如果当前机器没有 GPU 或 Isaac Gym，可以先验证 Dreamer Branch 的纯 PyTorch 核心逻辑：
+
+```bash
+# 需要一个可导入 torch 的 Python 环境
+python -m pytest legged_gym/tests/test_dreamer_behavior.py -q
+```
+
+该测试不依赖 Isaac Gym，只验证 imagined lambda-return 是否正确使用 final imagined state 的 slow-critic bootstrap。
+
 ---
 
 ## 5. 评测方案
@@ -204,7 +233,8 @@ python legged_gym/scripts/train.py --task=a1_amp --training_mode dreamerv3 --hea
 | **能耗** | torques reward, dof_acc reward | TensorBoard scalar |
 | **AMP 模仿质量** | AMP policy pred, AMP expert pred | TensorBoard scalar |
 | **WM 预测质量** | reward_loss, cont_loss, kl, image_loss | TensorBoard scalar |
-| **Behavior 训练** | actor_loss, actor_entropy, critic_loss | TensorBoard scalar（仅 Dreamer） |
+| **Behavior 训练** | actor_loss, actor_entropy, critic_loss, imagined_reward, imagined_value | TensorBoard scalar（仅 Dreamer） |
+| **AMP 辅助训练** | amp_loss, amp_grad_pen | TensorBoard scalar（仅 Dreamer） |
 | **训练效率** | Computation steps/s, iteration time | 控制台输出 |
 
 ### 5.2 对比实验设计
@@ -254,11 +284,20 @@ GPU 显存: ___ GB
 ### 6.1 当前限制
 
 1. **reward_head 刚启用**：`loss_scale` 从 0 改为 1，需要观察 reward prediction 是否收敛
-2. **cont_head 刚启用**：首次训练 continuation prediction，可能需要调 `loss_scale`
-3. **Dreamer actor 用于 real rollout**：当前 DreamerRunner 在 real rollout 中用 Dreamer actor（从 WM latent 采样），而非 PPO actor。actor 输出 60-dim chunk-step action，取前 12-dim 给 env 执行。WM 训练早期可能不稳定
-4. **无 privileged bootstrap**：当前 Dreamer Branch 的 latent critic 完全不走 privileged info，bootstrap 功能尚未实现
+2. **cont_head 刚启用**：首次训练 continuation prediction，`is_terminal` 仅在 episode 末尾标记，中间 chunk-step 的 terminal 语义较粗
+3. **Dreamer actor 用于 real rollout**：每 chunk（5 env-steps）采样一次 60-dim 动作，reshape 为 (5,12) 后逐步执行。WM 训练早期 latent 质量不足时可能不稳定
+4. **无 privileged bootstrap**：latent critic 已使用 slow critic 对 final imagined state 做 bootstrap，但未引入 privileged critic 作为 real-side support
 5. **Chunk-step 语义**：imagined horizon=16 对应 80 env-steps ≈ 0.4s，可能偏短
-6. **Actor 每 env-step 都采样**：但 WM feature 每 5 env-steps 才更新一次，导致连续 5 步用相同 feature 采样相同 60-dim action（取同一 12-dim slice 重复执行）
+6. **Actor 每 chunk 采样一次**：chunk 内 5 个 env-step 使用同一 WM feature 采样的不同 action slice，但 feature 本身不更新
+
+### 6.2 已知修复记录（v1.3）
+
+| 问题 | 修复 |
+|------|------|
+| `critic_loss` 未记录到 metrics | 补充 `metrics["critic_loss"]` |
+| `actor_loss` key 与 Optimizer 冲突 | 重命名为 `actor_reinforce_loss` |
+| 重复 `if self._discriminator` 检查 | 合并为一个 if 块 |
+| `discount`/`lambda_return` 未在 yaml 定义 | 补充到 `configs.yaml` |
 
 ### 6.2 如果训练不稳定
 
@@ -276,6 +315,7 @@ GPU 显存: ___ GB
 
 - [x] WMP 原版 `use_camera=False` 训练验证 ✅
 - [x] Dreamer Branch `use_camera=False` 训练验证 ✅（Iter 137+ 无 crash，核心路径跑通）
+- [x] 纯 PyTorch 行为学习回归测试 ✅（imagined bootstrap 逻辑已锁定）
 - [ ] Dreamer Branch `use_camera=True` 训练验证
 - [ ] 观察 reward_head / cont_head loss 收敛曲线
 - [ ] 对比 WMP vs Dreamer 的 reward 曲线
@@ -308,6 +348,10 @@ GPU 显存: ___ GB
 ### dreamer/configs.yaml（行为学习相关）
 
 ```yaml
+# Behavior learning
+discount: 0.997          # 折扣因子
+lambda_return: 0.95      # λ-return 系数
+
 actor:
   layers: 2
   dist: 'normal'

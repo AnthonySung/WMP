@@ -190,7 +190,7 @@ class DreamerActorCritic(nn.Module):
         total_loss = actor_loss - entropy_scale * entropy
 
         metrics = {
-            "actor_loss": actor_loss.detach().cpu().numpy(),
+            "actor_reinforce_loss": actor_loss.detach().cpu().numpy(),
             "actor_entropy": entropy.detach().cpu().numpy(),
         }
         actor_metrics = self.actor_opt(total_loss, self.actor.parameters())
@@ -211,7 +211,7 @@ class DreamerActorCritic(nn.Module):
         # log_prob expects original-scale value, symlog_disc handles symlog internally
         critic_loss = -value_dist.log_prob(target_value).mean()
 
-        metrics = {}
+        metrics = {"critic_loss": critic_loss.detach().cpu().numpy()}
         critic_metrics = self.critic_opt(critic_loss, self.critic.parameters())
         metrics.update(critic_metrics)
         return metrics

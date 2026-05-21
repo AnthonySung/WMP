@@ -125,14 +125,19 @@ class DreamerReplay:
         first_key = next(iter(self._dataset))
         device = self._dataset[first_key].device
 
-        # is_first: first step of each sequence is always the start
+        # Each sampled subsequence starts from an implicit latent reset because the
+        # replay does not carry over the previous posterior state.
         is_first = torch.zeros((batch_size, batch_length), device=device)
         is_first[:, 0] = 1
         batch_data["is_first"] = is_first
 
-        # is_terminal: derived from is_first (terminal[t] = is_first[t+1])
+        # Mark the true episode end when the sampled subsequence reaches the end of
+        # the stored episode for that env. Intermediate terminal markers are not
+        # available because wm_dataset stores one contiguous episode per env slot.
         is_terminal = torch.zeros((batch_size, batch_length), device=device)
-        is_terminal[:, :-1] = is_first[:, 1:]
+        for row, (idx, end_idx) in enumerate(zip(batch_idx, batch_end_idx)):
+            if end_idx >= self._dataset_size[idx]:
+                is_terminal[row, -1] = 1
         batch_data["is_terminal"] = is_terminal
 
         return batch_data

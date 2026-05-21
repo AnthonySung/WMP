@@ -1,5 +1,8 @@
 # WMP 与 DreamerV3 的区别，以及本项目的 Dreamer Branch 设计稿
 
+> 更新日期：2026-05-21  
+> 注：本文档仍以“设计稿”为主，但其中部分条目已经在当前代码中实现；实现细节请同时参考 [Dreamer Branch 实现文档](./Dreamer%20Branch%20实现文档.md)。
+
 ## 1. 目标
 
 本文档回答两个问题：
@@ -50,7 +53,8 @@ DreamerV3 的本质则是：
 - encoder；
 - RSSM；
 - decoder；
-- `reward_head` 的基础定义；
+- `reward_head`；
+- `cont_head`；
 - `lambda_return()` 工具函数。
 
 这意味着本项目适合新增 `Dreamer Branch`，但**不适合把现有 WMP 直接解释成 DreamerV3**。
@@ -153,6 +157,7 @@ post_state_t -> action_t -> prior_state_{t+1} -> action_{t+1} -> ...
 
 - AMP 继续基于真实 `amp_obs` 与 `next_amp_obs` 计算；
 - 不把当前 AMP 判别器输出直接当 imagined reward；
+- AMP discriminator 使用独立 optimizer，在 real rollout 后单独更新；
 - 如果以后要进入 imagination，需要单独设计 latent-compatible motion prior。
 
 当前 AMP reward 的实现位置：
@@ -200,6 +205,7 @@ post_state_t -> action_t -> prior_state_{t+1} -> action_{t+1} -> ...
 - discount 按 chunk-step 定义；
 - lambda return 按 chunk-step 定义；
 - imagined rollout 的时间尺度与 world-model-step 对齐。
+- 每个 chunk-step 只采样一次整段 chunk action，并在 chunk 内顺序执行各个 env-step slice。
 
 这条路线不是标准逐步 Dreamer replay，而是本项目现有数据语义上的 Dreamer-style behavior branch。
 
@@ -244,12 +250,10 @@ post_state_t -> action_t -> prior_state_{t+1} -> action_{t+1} -> ...
 - 当前 `AMPPPO` 作为 Dreamer behavior learner；
 - 当前 reward / continuation 头配置直接满足行为学习。
 
-其中 world model 当前还存在两个关键缺口：
+其中 world model 仍然存在需要持续验证的点：
 
-- `reward_head` 默认未有效训练：
-  [dreamer/configs.yaml:34-35](../dreamer/configs.yaml#L34-L35)
-- `cont_head` 仍未启用：
-  [dreamer/models.py:81-92](../dreamer/models.py#L81-L92)
+- `reward_head` 虽已启用，但在当前 chunk-step 数据上的预测质量仍需验证。
+- `cont_head` 虽已启用，但 replay terminal 语义仍然较粗。
 
 ---
 
@@ -283,8 +287,8 @@ post_state_t -> action_t -> prior_state_{t+1} -> action_{t+1} -> ...
 
 目标：
 
-- 启用并验证 `reward_head`；
-- 实现并验证 `cont_head`；
+- 验证已启用的 `reward_head`；
+- 验证已启用的 `cont_head`；
 - 明确 Dreamer replay 的 chunk-step 语义；
 - 证明 world model 已达到 imagined behavior 可用水平。
 
@@ -334,8 +338,8 @@ post_state_t -> action_t -> prior_state_{t+1} -> action_{t+1} -> ...
 
 当前 world model 还不是现成可用的 Dreamer behavior model：
 
-- reward 训练默认不足；
-- continuation 未启用；
+- reward 训练虽已接入，但是否足够支撑 imagined behavior 仍待验证；
+- continuation 已接入，但 terminal 标记仍然粗化；
 - replay 语义不是标准逐步版本。
 
 ### 9.3 系统耦合风险
@@ -407,11 +411,13 @@ Dreamer 分支通常需要额外保存：
 3. 新增 `DreamerRunner`
    - `rsl_rl/runners/dreamer_runner.py`
    - 负责 real rollout、world model update、behavior update、checkpoint
+   - 当前实现已修正 chunk-step 动作执行语义，并接入 AMP auxiliary update
    - 不修改 `WMPRunner` 的原始训练闭环
 
 4. 新增 `DreamerReplay`
    - `rsl_rl/storage/dreamer_replay.py`
    - 独立承载 chunk-step replay 语义
+   - 当前实现已补充采样窗口命中 episode 尾部时的 `is_terminal`
    - 不把现有 `wm_dataset` 直接改造成两用结构
 
 5. 补齐 world model 行为学习目标
@@ -425,6 +431,7 @@ Dreamer 分支通常需要额外保存：
    - `rsl_rl/algorithms/dreamer_behavior.py`
    - imagined rollout
    - actor / latent critic / slow critic update
+   - 当前实现已使用 final imagined state 的 slow critic 做 λ-return bootstrap
    - 不混入 `AMPPPO`
 
 7. 新增 `DreamerActorCritic`
@@ -440,6 +447,7 @@ Dreamer 分支通常需要额外保存：
 9. 保留 AMP auxiliary
    - 优先复用当前 `AMPDiscriminator`
    - 保持 real transition 训练链路
+   - 当前实现为独立 optimizer + 独立 update
    - imagined phase 不消费 AMP reward
 
 10. checkpoint

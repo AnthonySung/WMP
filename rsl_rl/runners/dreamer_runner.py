@@ -350,16 +350,23 @@ class DreamerRunner:
             )
 
         wm_action_history = torch.zeros(
-            (self.env.num_envs, self.wm_config.num_actions),
+            (self.env.num_envs, self.wm_update_interval, self.env.num_actions),
             device=self._world_model.device,
         )
         wm_reward = torch.zeros(self.env.num_envs, device=self._world_model.device)
         wm_feature = torch.zeros((self.env.num_envs, self.wm_feature_dim))
+        chunk_actions = torch.zeros_like(wm_action_history)
+        chunk_step_index = 0
 
         self.init_wm_dataset()
 
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
+            amp_obs_batches = []
+            amp_next_obs_batches = []
+            wm_metrics = {}
+            amp_metrics = {}
+            behavior_metrics = {}
 
             # --- Real Rollout ---
             with torch.inference_mode():
@@ -372,15 +379,13 @@ class DreamerRunner:
                         )
                         wm_feature = self._world_model.dynamics.get_feat(wm_latent)
                         wm_is_first[:] = 0
+                        chunk_actions = self._dreamer_ac.act(
+                            wm_feature.to(self._world_model.device), eval_mode=False,
+                        ).view(self.env.num_envs, self.wm_update_interval, self.env.num_actions)
+                        chunk_step_index = 0
 
-                    # Use Dreamer actor for action selection (from WM feature)
-                    actions = self._dreamer_ac.act(
-                        wm_feature.to(self._world_model.device), eval_mode=False,
-                    )
-                    # actions: (num_envs, wm_config.num_actions=60)
-                    # Reshape to (num_envs, wm_update_interval, env.num_actions) and take first step for env
-                    actions_reshaped = actions.view(self.env.num_envs, self.wm_update_interval, self.env.num_actions)
-                    actions_env = actions_reshaped[:, 0, :].to(self.device)
+                    # Execute the current action inside the sampled chunk.
+                    actions_env = chunk_actions[:, chunk_step_index, :].to(self.device)
 
                     obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states = \
                         self.env.step(actions_env)
@@ -389,8 +394,8 @@ class DreamerRunner:
                     obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
                     next_amp_obs = next_amp_obs.to(self.device)
 
-                    # Update WM input: store full 60-dim action
-                    wm_action_history = actions.to(self._world_model.device)
+                    # Track the exact actions executed inside the current chunk.
+                    wm_action_history[:, chunk_step_index, :] = actions_env.to(self._world_model.device)
                     wm_obs = {
                         "prop": obs[:, self.env.privileged_dim:self.env.privileged_dim + self.env.cfg.env.prop_dim].to(
                             self._world_model.device),
@@ -415,11 +420,13 @@ class DreamerRunner:
                         self.wm_buffer_index[reset_env_ids_np] = 0
                         sum_wm_dataset_size = np.sum(self.wm_dataset_size)
 
-                        wm_action_history[reset_env_ids_np, :] = 0
+                        wm_action_history[reset_env_ids_np, :, :] = 0
+                        chunk_actions[reset_env_ids_np, :, :] = 0
                         wm_is_first[reset_env_ids_np] = 1
 
-                    wm_action = wm_action_history  # already (num_envs, wm_config.num_actions=60)
+                    wm_action = wm_action_history.flatten(1)
                     wm_reward += rewards.to(self._world_model.device)
+                    chunk_step_index = (chunk_step_index + 1) % self.wm_update_interval
 
                     # Store into buffer
                     if self.env.global_counter % self.wm_update_interval == 0:
@@ -458,6 +465,8 @@ class DreamerRunner:
                     next_amp_obs_with_term = torch.clone(next_amp_obs)
                     next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
                     if self._discriminator is not None:
+                        amp_obs_batches.append(amp_obs.detach().cpu())
+                        amp_next_obs_batches.append(next_amp_obs_with_term.detach().cpu())
                         rewards = self._discriminator.predict_amp_reward(
                             amp_obs, next_amp_obs_with_term, rewards,
                             normalizer=self._amp_normalizer,
@@ -495,6 +504,16 @@ class DreamerRunner:
                     for name, values in wm_metrics.items():
                         self.writer.add_scalar('World_model/' + name, float(np.mean(values)), it)
 
+                # AMP discriminator update on real transitions
+                if self._discriminator is not None and amp_obs_batches:
+                    amp_metrics = self.train_amp(
+                        torch.cat(amp_obs_batches, dim=0).to(self.device),
+                        torch.cat(amp_next_obs_batches, dim=0).to(self.device),
+                    )
+                    if self.writer is not None:
+                        for name, value in amp_metrics.items():
+                            self.writer.add_scalar('AMP/' + name, float(value), it)
+
                 # Behavior learning (latent imagination)
                 behavior_metrics = self.train_behavior()
                 if self.writer is not None:
@@ -516,9 +535,6 @@ class DreamerRunner:
             if it == 0:
                 os.system("cp ./legged_gym/envs/a1/a1_amp_config.py " + self.log_dir + "/")
 
-            print(f"Iter {it}: collect={collection_time:.1f}s, train={train_time:.1f}s, "
-                  f"wm_data={sum_wm_dataset_size}")
-
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
 
@@ -527,18 +543,108 @@ class DreamerRunner:
     # ------------------------------------------------------------------
 
     def log(self, locs, width=200):
-        """Log training metrics to tensorboard."""
+        """Log training metrics to tensorboard and stdout."""
         it = locs['it']
+        self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
+        self.tot_time += locs['collection_time'] + locs['train_time']
+        iteration_time = locs['collection_time'] + locs['train_time']
+        fps = int(self.num_steps_per_env * self.env.num_envs / max(iteration_time, 1e-6))
+
+        rewbuffer = locs['rewbuffer']
+        lenbuffer = locs['lenbuffer']
+        wm_metrics = locs.get('wm_metrics', {}) or {}
+        amp_metrics = locs.get('amp_metrics', {}) or {}
+        behavior_metrics = locs.get('behavior_metrics', {}) or {}
+        ep_infos = locs.get('ep_infos', [])
+
+        mean_reward = statistics.mean(rewbuffer) if len(rewbuffer) > 0 else None
+        mean_length = statistics.mean(lenbuffer) if len(lenbuffer) > 0 else None
+        training_started = locs['sum_wm_dataset_size'] > self.wm_config.train_start_steps
+        warmup_remaining = max(0, self.wm_config.train_start_steps - locs['sum_wm_dataset_size'])
+        episode_metrics = {}
+
+        if ep_infos:
+            for key in ep_infos[0]:
+                values = []
+                for ep_info in ep_infos:
+                    value = ep_info[key]
+                    if not isinstance(value, torch.Tensor):
+                        value = torch.tensor([value], device=self.device, dtype=torch.float32)
+                    else:
+                        value = value.to(self.device)
+                        if len(value.shape) == 0:
+                            value = value.unsqueeze(0)
+                    values.append(value)
+                episode_metrics[key] = float(torch.cat(values).mean().item())
+
+        if self.writer is not None:
+            self.writer.add_scalar('Perf/total_fps', fps, it)
+            self.writer.add_scalar('Perf/collection_time', locs['collection_time'], it)
+            self.writer.add_scalar('Perf/train_time', locs['train_time'], it)
+            self.writer.add_scalar('Perf/iteration_time', iteration_time, it)
+
+            if mean_reward is not None:
+                self.writer.add_scalar('Train/mean_reward', mean_reward, it)
+                self.writer.add_scalar('Train/mean_episode_length', mean_length, it)
+                self.writer.add_scalar('Train/mean_reward/time', mean_reward, self.tot_time)
+                self.writer.add_scalar('Train/mean_episode_length/time', mean_length, self.tot_time)
+
+            for key, value in episode_metrics.items():
+                self.writer.add_scalar('Episode/' + key, value, it)
+
         if it % 10 != 0:
             return
 
-        # Episode stats
-        if len(locs['rewbuffer']) > 0:
-            self.writer.add_scalar('Episode/mean_reward', statistics.mean(locs['rewbuffer']), it)
-            self.writer.add_scalar('Episode/mean_length', statistics.mean(locs['lenbuffer']), it)
+        summary_parts = [
+            f"collect={locs['collection_time']:.2f}s",
+            f"train={locs['train_time']:.2f}s",
+            f"fps={fps}",
+            f"wm_data={locs['sum_wm_dataset_size']:.0f}",
+        ]
+        if mean_reward is not None:
+            summary_parts.append(f"reward={mean_reward:.2f}")
+            summary_parts.append(f"ep_len={mean_length:.2f}")
+        if not training_started:
+            summary_parts.append(f"status=warmup({warmup_remaining:.0f}_chunks_left)")
+        elif not wm_metrics:
+            summary_parts.append("status=collect_only")
 
-        self.writer.add_scalar('Time/collection', locs['collection_time'], it)
-        self.writer.add_scalar('Time/train', locs['train_time'], it)
+        metric_specs = [
+            ('wm_reward_loss', wm_metrics.get('reward_loss')),
+            ('wm_cont_loss', wm_metrics.get('cont_loss')),
+            ('wm_kl', wm_metrics.get('kl')),
+            ('amp_loss', amp_metrics.get('amp_loss')),
+            ('amp_policy', amp_metrics.get('amp_policy_pred')),
+            ('amp_expert', amp_metrics.get('amp_expert_pred')),
+            ('actor_loss', behavior_metrics.get('actor_loss')),
+            ('critic_loss', behavior_metrics.get('critic_loss')),
+            ('imag_reward', behavior_metrics.get('imagined_reward')),
+            ('imag_value', behavior_metrics.get('imagined_value')),
+        ]
+        for label, value in metric_specs:
+            if value is None:
+                continue
+            if isinstance(value, np.ndarray):
+                value = float(np.mean(value))
+            summary_parts.append(f"{label}={float(value):.4f}")
+
+        preferred_episode_keys = [
+            'rew_total',
+            'tracking_lin_vel',
+            'tracking_ang_vel',
+            'torques',
+            'dof_acc',
+            'feet_air_time',
+        ]
+        for key in preferred_episode_keys:
+            if key in episode_metrics:
+                summary_parts.append(f"{key}={episode_metrics[key]:.4f}")
+
+        extra_episode_keys = [k for k in sorted(episode_metrics.keys()) if k not in preferred_episode_keys]
+        for key in extra_episode_keys[:4]:
+            summary_parts.append(f"{key}={episode_metrics[key]:.4f}")
+
+        print(f"Iter {it}: " + ", ".join(summary_parts))
 
     def save(self, path):
         """Save checkpoint."""

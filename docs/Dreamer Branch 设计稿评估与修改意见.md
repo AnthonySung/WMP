@@ -1,22 +1,22 @@
 # Dreamer Branch 设计稿评估与修改意见
 
 > 评估对象：[与dreamerv3区别.md](./与dreamerv3区别.md)  
-> 评估日期：2026-05-18  
+> 评估日期：2026-05-21  
 > 评估方式：逐条对照代码验证，覆盖 `rsl_rl/`、`dreamer/`、`legged_gym/` 三个主要模块
 
 ---
 
 ## 1. 总体评价
 
-**方案方向正确，但对代码层面的耦合深度和 world model 当前训练状态偏乐观。**
+**方案方向正确，但原评估中关于 world model 缺口的若干判断已经过时；当前重点已从“是否接入”转为“接入后是否足够稳定”。**
 
 设计稿的核心判断——"分 runner、分模块、显式 mode switch"——是唯一可行的架构路线。但在以下三个关键维度上需要修正预期：
 
-| 维度 | 设计稿判断 | 代码实际 | 偏差 |
-|------|-----------|----------|------|
-| WM reward head 状态 | "基础定义存在" | `loss_scale: 0.0`，完全不参与训练 | 高 |
-| WM cont head 状态 | "仍未启用" | 整段代码被注释掉 | 高 |
-| WMP Runner 可拆分性 | 未具体评估 | 477 行单文件，PPO rollout 与 WM 逻辑深度交织 | 中 |
+| 维度 | 设计稿判断 | 代码实际 | 当前结论 |
+|------|-----------|----------|----------|
+| WM reward head 状态 | "基础定义存在" | 已启用，但预测质量待验证 | 仍需重点观察 |
+| WM cont head 状态 | "仍未启用" | 已启用，但 terminal 语义较粗 | 仍需重点观察 |
+| WMP Runner 可拆分性 | 未具体评估 | 477 行单文件，PPO rollout 与 WM 逻辑深度交织 | 结论不变 |
 
 ---
 
@@ -32,37 +32,23 @@
 - `lambda_return()`（`dreamer/tools.py:717-743`）
 - `MultiEncoder` / `MultiDecoder`
 
-❌ 缺失的（设计稿承认但低估了工作量）：
+⚠️ 当前仍需重点验证的：
 
-**`reward_head` 虽然定义但 `loss_scale=0`**：
+**`reward_head` 已接入训练，但预测质量未知**
 
-```yaml
-# dreamer/configs.yaml:34-35
-reward_head:
-  {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
-```
+- 当前实现已将 `reward_head.loss_scale` 打开，并在 WM 训练中参与梯度更新。
+- 问题已从“是否训练”变成“在当前 chunk-step 数据上是否足够准确”。
 
-这意味着 reward head 虽然参与前向计算（`models.py:125-133`），但 loss 被乘 0 后不影响梯度。实际上 reward prediction 从未被训练过。
+**`cont_head` 已接入训练，但 replay terminal 语义仍较粗**
 
-**`cont_head` 整段被注释掉**：
-
-```python
-# dreamer/models.py:81-92
-# self.heads["cont"] = networks.MLP(
-#     feat_size,
-#     (),
-#     config.cont_head["layers"],
-#     ...
-# )
-```
-
-`_scales` 字典里也没有 `cont` 的 key。continuation prediction 完全不存在。
+- 当前实现已启用 `cont_head` 并参与 WM 训练。
+- 但 `DreamerReplay` 只在采样窗口命中 env slot 当前 episode 尾部时设置 `is_terminal=1`，还没有更细粒度的 chunk 内边界信息。
 
 **修改意见**：
 
 > 将设计稿"第二步：补齐 world model 行为学习前提"拆分为两步：
 > - **第 1.5 步**（spike）：单独验证 `reward_head` 和 `cont_head` 在当前 chunk-step 数据上的预测能力
-> - **第二步**：正式补齐并调参
+> - **第二步**：在已接入前提下继续调参与误差分析
 
 ### 2.2 "不应直接复用 ActorCriticWMP" — 完全正确
 
@@ -160,6 +146,12 @@ batch_length = min(int(self.wm_dataset_size[batch_idx].min()), self.wm_config.ba
 > 2. `is_first` 标记的插入规则（episode 边界）
 > 3. batch_length 与 imagined horizon 的关系
 
+**当前实现补充**：
+
+- 已将采样子序列第一个时间步统一标记为 `is_first=1`
+- 已在采样窗口命中 episode 尾部时标记最后一步 `is_terminal=1`
+- 但仍未显式保存 chunk 内部更细粒度 episode 边界
+
 ### 2.6 "保留视觉链路" — 回避了 DepthPredictor 的归属
 
 **相关文件**：`rsl_rl/modules/depth_predictor.py`、`rsl_rl/runners/wmp_runner.py:310-319`
@@ -180,7 +172,7 @@ if (self.env.cfg.depth.use_camera):
 
 > 在设计稿中补充：`DepthPredictor` 在 Dreamer Branch 里继续作为 WM 输入预处理器，其训练循环放在 `DreamerRunner` 的 real-side 逻辑中，不与 behavior learning 耦合。
 
-### 2.7 "AMP 放在 real rollout side" — 边界正确但 optimizer 归属不明
+### 2.7 "AMP 放在 real rollout side" — 边界正确，当前实现已补上 optimizer 归属
 
 **相关文件**：`rsl_rl/algorithms/amp_ppo.py:172-260`、`rsl_rl/algorithms/amp_discriminator.py`
 
@@ -200,6 +192,11 @@ self.optimizer = optim.Adam(params, lr=learning_rate)
 - Behavior actor / latent critic 有独立的 optimizer
 - WM 也有独立的 optimizer
 
+**当前实现状态**：
+
+- `AMPDiscriminator` 已使用独立 optimizer
+- 更新时机已接入到每个 Dreamer iteration 的 real rollout 之后、behavior update 之前
+
 **修改意见**：
 
 > 在设计稿中明确 AMP 的 optimizer 归属：
@@ -215,8 +212,8 @@ self.optimizer = optim.Adam(params, lr=learning_rate)
 | 步骤 | 设计稿 | 评估 | 需要补充 |
 |------|--------|------|----------|
 | 第一步 | 拆模式分发与参数链路 | ✅ 正确 | **增加**：WM config 加载去 `sys.argv` 化 |
-| **新增 1.5** | — | 🔴 缺失 | **验证 reward/cont head 在现有数据上的训练可行性** |
-| 第二步 | 补齐 reward/cont head | ⚠️ 被低估 | 从 `loss_scale=0` / 注释状态到可用，需要调参验证 |
+| **新增 1.5** | — | 仍然必要 | **验证 reward/cont head 在现有数据上的训练可行性** |
+| 第二步 | 补齐 reward/cont head | 已部分落地 | 从“已接入”继续推进到“可稳定支撑 behavior” |
 | 第三步 | 做 hybrid baseline | ✅ 合理 | — |
 | 第四步 | 关键消融 | ✅ 合理 | — |
 | 第五步 | motion prior imagination 化 | 远期 | 暂不评估 |
@@ -225,11 +222,10 @@ self.optimizer = optim.Adam(params, lr=learning_rate)
 
 如果 reward prediction 在当前数据上无法收敛，后续所有 behavior learning 都不可靠。这个 spike 需要验证：
 
-1. 将 `reward_head.loss_scale` 从 `0.0` 改为 `1.0`
-2. 取消注释 `cont_head`，训练 continuation prediction
-3. 观察 reward loss 和 cont loss 的收敛曲线
-4. 检查 predicted reward 与真实累计 reward 的相关性
-5. 如果失败，分析原因（数据分布、chunk-step 噪声、WM 容量等）
+1. 观察 `reward_head` 与 `cont_head` 的收敛曲线
+2. 检查 predicted reward 与真实累计 reward 的相关性
+3. 评估粗粒度 `is_terminal` 对 continuation prediction 的影响
+4. 如果失败，分析原因（数据分布、chunk-step 噪声、WM 容量、terminal 标注粗化等）
 
 ---
 
@@ -297,9 +293,9 @@ critic:
 ### 5.1 新增条目
 
 0. **前置验证（第 1.5 步）**
-   - 将 `reward_head.loss_scale` 改为 `1.0`，验证 reward prediction 收敛性
-   - 取消注释 `cont_head`，实现 continuation prediction
+   - 在当前已接入实现上验证 reward prediction / continuation prediction 收敛性
    - 确认训练后 WM 的 reward/cont 预测误差在可接受范围
+   - 检查粗粒度 terminal 标记是否足以支撑 `cont_head`
    - **如果失败，暂停后续步骤，先分析根因**
 
 ### 5.2 修改条目
@@ -310,8 +306,8 @@ critic:
    - 删除 `sys.argv` 和 `argparse` 的二次依赖
 
 5. **补齐 world model** — 拆分为：
-   - 5a. reward_head 启用并验证（从 `loss_scale=0` 到可用）
-   - 5b. cont_head 实现并验证（从注释到可用）
+   - 5a. reward_head 验证与调参（从“已接入”到“可用”）
+   - 5b. cont_head 验证与调参（从“已接入”到“可用”）
 
 ### 5.3 新增小节建议
 
@@ -327,7 +323,7 @@ critic:
 
 ## 6. 一句话结论
 
-**设计稿对边界划分（什么属于 Dreamer Branch、什么不属于 imagined phase）的判断全部正确，但对代码层面 WM 的训练缺口（reward 未训、cont 缺失）和工程耦合度（`sys.argv` 依赖、150 行无分解主循环）偏乐观。建议在启动第一步架构拆分前，先做一个 spike 验证 reward/cont head 在当前数据上的可训练性。如果这一步失败，后续架构工作没有意义。**
+**设计稿对边界划分（什么属于 Dreamer Branch、什么不属于 imagined phase）的判断全部正确。当前代码已经补上 reward/cont/AMP auxiliary 的核心接线，但仍需继续验证这些实现是否足以稳定支撑 imagined behavior learning。换句话说，问题已从“有没有接上”转为“接上之后训得好不好”。**
 
 ---
 
@@ -339,8 +335,8 @@ critic:
 | WM train 主循环 | `rsl_rl/runners/wmp_runner.py` | 228-375 |
 | WM dataset 初始化 | `rsl_rl/runners/wmp_runner.py` | 384-420 |
 | WM batch 采样与训练 | `rsl_rl/runners/wmp_runner.py` | 455-477 |
-| reward_head 定义（loss_scale=0） | `dreamer/configs.yaml` | 34-35 |
-| cont_head 注释 | `dreamer/models.py` | 81-92 |
+| reward_head / cont_head 配置 | `dreamer/configs.yaml` | 28-39 |
+| WorldModel heads 与训练 | `dreamer/models.py` | 51-113 |
 | RSSM imagine_with_action | `dreamer/networks.py` | 162-167 |
 | lambda_return 工具函数 | `dreamer/tools.py` | 717-743 |
 | ActorCriticWMP evaluate | `rsl_rl/modules/actor_critic_wmp.py` | 205-210 |
