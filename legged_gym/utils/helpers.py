@@ -175,11 +175,13 @@ def apply_dreamer_env_overrides(env_cfg, train_cfg):
     dreamer_use_image = getattr(train_cfg.runner, "dreamer_use_image", False)
     if mode in ("align", "takeover") and not dreamer_use_image:
         env_cfg.depth.use_camera = False
+    if mode in ("align", "takeover") and dreamer_use_image:
+        env_cfg.env.num_envs = min(env_cfg.env.num_envs, env_cfg.depth.camera_num_envs)
     return env_cfg
 
 def get_args():
     custom_parameters = [
-        {"name": "--task", "type": str, "default": "anymal_c_flat", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
+        {"name": "--task", "type": str, "default": "a1_amp", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
         {"name": "--resume", "action": "store_true", "default": False,  "help": "Resume training from a checkpoint"},
         {"name": "--experiment_name", "type": str,  "help": "Name of the experiment to run or load. Overrides config file if provided."},
         {"name": "--run_name", "type": str,  "help": "Name of the run. Overrides config file if provided."},

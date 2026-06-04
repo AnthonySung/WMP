@@ -43,6 +43,7 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Logger
+from legged_gym.utils.helpers import update_cfg_from_args, apply_dreamer_env_overrides
 
 import numpy as np
 import torch
@@ -50,6 +51,8 @@ import torch
 
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+    env_cfg, train_cfg = update_cfg_from_args(env_cfg, train_cfg, args)
+    mode = getattr(train_cfg.runner, "wmp_training_mode", "wmp")
     # override some parameters for testing
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 10)
     env_cfg.terrain.num_cols = 1
@@ -107,7 +110,10 @@ def play(args):
     env_cfg.commands.ranges.flat_lin_vel_y = [-0.0, -0.0]
     env_cfg.commands.ranges.flat_ang_vel_yaw = [0.0, 0.0]
 
-    env_cfg.depth.use_camera = True
+    if mode == "wmp":
+        env_cfg.depth.use_camera = True
+    else:
+        env_cfg = apply_dreamer_env_overrides(env_cfg, train_cfg)
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
@@ -115,7 +121,9 @@ def play(args):
     obs = env.get_observations()
     # load policy
     train_cfg.runner.resume = True
-    train_cfg.runner.load_run = 'WMP'
+    if args.load_run is None:
+        image_suffix = "_image" if getattr(train_cfg.runner, "dreamer_use_image", False) else ""
+        train_cfg.runner.load_run = f'WMP_{mode}{image_suffix}'
 
 
     train_cfg.runner.checkpoint = -1
@@ -123,10 +131,12 @@ def play(args):
     policy = ppo_runner.get_inference_policy(device=env.device)
     
     # export policy as a jit module (used to run it from C++)
-    if EXPORT_POLICY:
+    if EXPORT_POLICY and mode == "wmp":
         path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'policies')
         export_policy_as_jit(ppo_runner.alg.actor_critic, path)
         print('Exported policy as jit script to: ', path)
+    elif EXPORT_POLICY:
+        print(f"Skipping PPO policy export for Dreamer mode '{mode}'.")
 
     logger = Logger(env.dt)
     robot_index = 0 # which robot is used for logging
@@ -148,7 +158,7 @@ def play(args):
     world_model = ppo_runner._world_model.to(env.device)
     wm_latent = wm_action = None
     wm_is_first = torch.ones(env.num_envs, device=env.device)
-    wm_update_interval = env.cfg.depth.update_interval
+    wm_update_interval = env.cfg.depth.update_interval if mode == "wmp" else 1
     wm_action_history = torch.zeros(size=(env.num_envs, wm_update_interval, env.num_actions),
                                     device=env.device)
     wm_obs = {
@@ -164,9 +174,10 @@ def play(args):
 
     total_reward = 0
     not_dones = torch.ones((env.num_envs,), device=env.device)
+    infos = {"depth": None, "episode": None}
     for i in range(1*int(env.max_episode_length) + 3):
         if (env.global_counter % wm_update_interval == 0):
-            if (env.cfg.depth.use_camera):
+            if (env.cfg.depth.use_camera and infos.get("depth", None) is not None):
                 wm_obs["image"][env.depth_index] = infos["depth"].unsqueeze(-1).to(world_model.device)
 
             wm_embed = world_model.encoder(wm_obs)
@@ -175,7 +186,10 @@ def play(args):
             wm_is_first[:] = 0
 
         history = trajectory_history.flatten(1).to(env.device)
-        actions = policy(obs.detach(), history.detach(), wm_feature.detach())
+        if mode == "wmp":
+            actions = policy(obs.detach(), history.detach(), wm_feature.detach())
+        else:
+            actions = ppo_runner._imag_behavior.act_from_state(wm_latent, deterministic=True).to(env.device)
 
 
         obs, _, rews, dones, infos, reset_env_ids, _ = env.step(actions.detach())
@@ -186,6 +200,7 @@ def play(args):
         # update world model input
         wm_action_history = torch.concat(
             (wm_action_history[:, 1:], actions.unsqueeze(1)), dim=1)
+        prev_image = wm_obs.get("image", None)
         wm_obs = {
             "prop": obs[:, env.privileged_dim: env.privileged_dim + env.cfg.env.prop_dim],
             "is_first": wm_is_first,
@@ -193,13 +208,15 @@ def play(args):
         if (env.cfg.depth.use_camera):
             wm_obs["image"] = torch.zeros(((env.num_envs,) + env.cfg.depth.resized + (1,)),
                                           device=world_model.device)
+            if prev_image is not None:
+                wm_obs["image"].copy_(prev_image)
 
         reset_env_ids = reset_env_ids.cpu().numpy()
         if (len(reset_env_ids) > 0):
             wm_action_history[reset_env_ids, :] = 0
             wm_is_first[reset_env_ids] = 1
 
-        wm_action = wm_action_history.flatten(1)
+        wm_action = wm_action_history.flatten(1) if mode == "wmp" else actions
 
 
         # process trajectory history

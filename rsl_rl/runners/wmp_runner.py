@@ -249,10 +249,16 @@ class WMPRunner:
             "reward": torch.zeros((self.env.num_envs, horizon), device='cpu'),
             "is_terminal": torch.zeros((self.env.num_envs, horizon), device='cpu'),
         }
+        if self.dreamer_use_image:
+            image_shape = self.env.cfg.depth.resized + (1,)
+            self.dreamer_dataset["image"] = torch.zeros(
+                (self.env.num_envs, horizon) + image_shape, device=self._world_model.device)
+            self.dreamer_buffer["image"] = torch.zeros(
+                (self.env.num_envs, horizon) + image_shape, device='cpu')
         self.dreamer_dataset_size = np.zeros(self.env.num_envs)
         self.dreamer_buffer_index = np.zeros(self.env.num_envs, dtype=np.int64)
 
-    def store_dreamer_step(self, prop, action, reward, done):
+    def store_dreamer_step(self, prop, action, reward, done, image=None):
         indices = np.arange(self.env.num_envs)
         step = self.dreamer_buffer_index
         capacity = self.dreamer_buffer["reward"].shape[1]
@@ -265,7 +271,24 @@ class WMPRunner:
         self.dreamer_buffer["action"][env_ids, step_ids, :] = action[env_ids].detach().to('cpu')
         self.dreamer_buffer["reward"][env_ids, step_ids] = reward[env_ids].detach().to('cpu')
         self.dreamer_buffer["is_terminal"][env_ids, step_ids] = done[env_ids].float().detach().to('cpu')
+        if self.dreamer_use_image:
+            if image is None:
+                raise ValueError("dreamer_use_image=True requires image data in store_dreamer_step().")
+            self.dreamer_buffer["image"][env_ids, step_ids, :] = image[env_ids].detach().to('cpu')
         self.dreamer_buffer_index[env_ids] += 1
+
+    def _make_dreamer_image_obs(self, infos=None, fallback=None):
+        if not self.dreamer_use_image:
+            return None
+        image = torch.zeros(
+            ((self.env.num_envs,) + self.env.cfg.depth.resized + (1,)),
+            device=self._world_model.device)
+        if fallback is not None:
+            image.copy_(fallback.to(self._world_model.device))
+        depth = None if infos is None else infos.get("depth", None)
+        if depth is not None:
+            image[self.env.depth_index] = depth.unsqueeze(-1).to(self._world_model.device)
+        return image
 
     def flush_dreamer_resets(self, reset_env_ids):
         if len(reset_env_ids) == 0:
@@ -339,6 +362,7 @@ class WMPRunner:
                                                              high=int(self.env.max_episode_length))
 
         obs = self.env.get_observations().to(self.device)
+        last_image_obs = self._make_dreamer_image_obs()
         privileged_obs = self.env.get_privileged_observations()
         amp_obs = self.env.get_amp_observations().to(self.device)
         critic_obs = (privileged_obs if privileged_obs is not None else obs).to(self.device)
@@ -374,6 +398,8 @@ class WMPRunner:
                 for _ in range(self.num_steps_per_env):
                     prop = self._get_wm_prop(obs)
                     wm_obs = {"prop": prop, "is_first": dreamer_is_first}
+                    if self.dreamer_use_image:
+                        wm_obs["image"] = last_image_obs
                     wm_embed = self._world_model.encoder(wm_obs)
                     dreamer_latent, _ = self._world_model.dynamics.obs_step(
                         dreamer_latent, dreamer_action, wm_embed, dreamer_is_first)
@@ -409,8 +435,11 @@ class WMPRunner:
                     train_rewards = env_rewards if self.dreamer_reward_mode == "env" else amp_rewards
 
                     next_prop = self._get_wm_prop(obs)
+                    last_image_obs = self._make_dreamer_image_obs(infos, fallback=last_image_obs)
                     self.store_dreamer_step(next_prop, actions.to(self._world_model.device),
-                                            train_rewards.to(self._world_model.device), dones.to(self._world_model.device))
+                                            train_rewards.to(self._world_model.device),
+                                            dones.to(self._world_model.device),
+                                            image=last_image_obs)
                     self.flush_dreamer_resets(reset_env_ids_np)
 
                     if train_ppo_this_step:

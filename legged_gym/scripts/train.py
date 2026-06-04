@@ -50,9 +50,13 @@ def train(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     env_cfg, train_cfg = update_cfg_from_args(env_cfg, train_cfg, args)
 
-    train_cfg.runner.run_name = 'WMP'
+    mode = getattr(train_cfg.runner, "wmp_training_mode", "wmp")
+    image_suffix = "_image" if getattr(train_cfg.runner, "dreamer_use_image", False) else ""
+    if args.run_name is None:
+        train_cfg.runner.run_name = f'WMP_{mode}{image_suffix}'
 
-    train_cfg.runner.max_iterations = 100000
+    if args.max_iterations is None:
+        train_cfg.runner.max_iterations = 100000
     train_cfg.runner.save_interval = 1000
     env_cfg = apply_dreamer_env_overrides(env_cfg, train_cfg)
 

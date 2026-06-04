@@ -97,6 +97,8 @@ class TaskRegistry():
         dreamer_use_image = bool(getattr(args, "dreamer_use_image", False))
         if mode in ("align", "takeover") and not dreamer_use_image:
             env_cfg.depth.use_camera = False
+        if mode in ("align", "takeover") and dreamer_use_image:
+            env_cfg.env.num_envs = min(env_cfg.env.num_envs, env_cfg.depth.camera_num_envs)
         set_seed(env_cfg.seed)
         # parse sim params (convert to dict first)
         sim_params = {"sim": class_to_dict(env_cfg.sim)}
