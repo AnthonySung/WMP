@@ -151,6 +151,9 @@ CUDA_VISIBLE_DEVICES=3 python legged_gym/scripts/play.py \
 - replay 中保存真实 `is_first`，batch 采样不再人为把每个窗口第 0 步都标成 episode start。
 - takeover 使用 episode-level controller assignment，reset 时按 `p_dreamer` 采样该 episode 由 PPO 或 Dreamer 控制。
 - takeover 的 PPO 更新使用 `valid_mask`，只用 PPO-controlled transition 更新 PPO/AMP，Dreamer-controlled transition 只进入 Dreamer world model replay。
+- follow-up review 中提到的 RolloutStorage overflow 是误报：`AMPPPO.update()` 正常路径和空 mask 路径都会调用 `storage.clear()`，云端多轮 takeover 已验证无 overflow。
+- Dreamer world model / behavior metrics 现在按本轮所有 update 求均值记录，不再只保留最后一个 batch。
+- takeover 在当前 step 没有 PPO-controlled env 时会跳过 PPO actor action 计算，减少无用开销。
 
 ## 单 GPU 云端 Smoke Test
 

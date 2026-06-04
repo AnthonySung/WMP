@@ -320,16 +320,22 @@ class WMPRunner:
             ])
         return batch_data
 
+    def _merge_metrics(self, accumulator, metrics):
+        for name, value in metrics.items():
+            accumulator.setdefault(name, []).append(value)
+
+    def _mean_metrics(self, accumulator):
+        return {name: np.mean(values, axis=0) for name, values in accumulator.items()}
+
     def train_dreamer_world_model(self):
         metrics = {}
-        mets = {}
         for _ in range(self.wm_config.train_steps_per_iter):
             batch_data = self.sample_dreamer_batch()
             if batch_data is None:
                 continue
             post, context, mets = self._world_model._train(batch_data)
-        metrics.update(mets)
-        return metrics
+            self._merge_metrics(metrics, mets)
+        return self._mean_metrics(metrics)
 
     def train_dreamer_behavior(self):
         metrics = {}
@@ -351,8 +357,8 @@ class WMPRunner:
                 state_feat = self._world_model.dynamics.get_feat(state)
                 return self._world_model.heads["reward"](state_feat).mode()
 
-            metrics.update(self._imag_behavior.train_from_posterior(post, reward_fn))
-        return metrics
+            self._merge_metrics(metrics, self._imag_behavior.train_from_posterior(post, reward_fn))
+        return self._mean_metrics(metrics)
 
     def learn_dreamer_modes(self, num_learning_iterations, init_at_random_ep_len=False):
         if self.log_dir is not None and self.writer is None:
@@ -391,8 +397,6 @@ class WMPRunner:
                 self.env.update_reward_curriculum(it)
             p_dreamer = self._takeover_probability(it, np.sum(self.dreamer_dataset_size))
             start = time.time()
-            used_ppo_rollout = False
-            used_mixed_controller = False
             ep_infos = []
             if self.training_mode == "align":
                 dreamer_controller_mask[:] = True
@@ -422,13 +426,11 @@ class WMPRunner:
                     if collect_ppo_this_step:
                         ppo_actions = self.alg.act(obs, critic_obs, amp_obs, history, wm_feature.to(self.device))
                     else:
-                        ppo_actions = self.alg.actor_critic.act(obs, history, wm_feature.to(self.device)).detach()
+                        ppo_actions = torch.zeros((self.env.num_envs, self.env.num_actions), device=self.device)
                     dreamer_actions = self._imag_behavior.act_from_state(
                         dreamer_latent, deterministic=False).to(self.device)
                     if self.training_mode == "align":
                         dreamer_controller_mask[:] = True
-                    used_ppo_rollout = used_ppo_rollout or bool((~dreamer_controller_mask).any().item())
-                    used_mixed_controller = used_mixed_controller or bool(dreamer_controller_mask.any().item())
                     actions = torch.where(dreamer_controller_mask.unsqueeze(-1), dreamer_actions, ppo_actions)
 
                     obs, privileged_obs, env_rewards, dones, infos, reset_env_ids, terminal_amp_states = self.env.step(actions)
