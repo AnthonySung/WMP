@@ -149,6 +149,12 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.runner.load_run = args.load_run
         if args.checkpoint is not None:
             cfg_train.runner.checkpoint = args.checkpoint
+        if args.use_imagination_learning is not None:
+            cfg_train.runner.use_imagination_learning = args.use_imagination_learning
+        if args.imagination_start_after is not None:
+            cfg_train.runner.imagination_start_after = args.imagination_start_after
+        if args.imagination_updates_per_iter is not None:
+            cfg_train.runner.imagination_updates_per_iter = args.imagination_updates_per_iter
 
     return env_cfg, cfg_train
 
@@ -170,6 +176,12 @@ def get_args():
         {"name": "--terrain", "type": str, "default": "climb",
          "help": 'Only for play'},
         {"name": "--wm_device", "type": str, "default": "None", "help": 'World model device. Overrides config file in dreamer/config.yaml if provided'},
+        {"name": "--use_imagination_learning", "action": "store_true", "default": None,
+         "help": "Enable Dreamer Branch behavior learning from imagined RSSM rollouts."},
+        {"name": "--imagination_start_after", "type": int,
+         "help": "Minimum world-model dataset size before starting imagination behavior updates."},
+        {"name": "--imagination_updates_per_iter", "type": int,
+         "help": "Number of imagination behavior updates per training iteration."},
 
     ]
     # parse arguments

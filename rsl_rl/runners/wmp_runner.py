@@ -50,6 +50,7 @@ from rsl_rl.modules import DepthPredictor
 import torch.optim as optim
 
 from dreamer.models import *
+from dreamer.behavior import ImagBehavior
 import ruamel.yaml as yaml
 import argparse
 import pathlib
@@ -88,6 +89,13 @@ class WMPRunner:
 
         # build world model
         self._build_world_model()
+        self.use_imagination_learning = self.cfg.get("use_imagination_learning", False)
+        self.imagination_replace_ppo = self.cfg.get("imagination_replace_ppo", False)
+        self.imagination_start_after = self.cfg.get("imagination_start_after", self.wm_config.train_start_steps)
+        self.imagination_updates_per_iter = self.cfg.get("imagination_updates_per_iter", 1)
+        self._imag_behavior = None
+        if self.use_imagination_learning:
+            self._build_imag_behavior()
 
         # build depth predictor
         self.depth_predictor = DepthPredictor().to(self._world_model.device)
@@ -178,6 +186,12 @@ class WMPRunner:
         self._world_model = self._world_model.to(self._world_model.device)
         print('Finish construct world model')
         self.wm_feature_dim = self.wm_config.dyn_deter #+ self.wm_config.dyn_stoch * self.wm_config.dyn_discrete
+
+    def _build_imag_behavior(self):
+        print('Begin construct Dreamer Branch imagination behavior')
+        self._imag_behavior = ImagBehavior(self.wm_config, self._world_model)
+        self._imag_behavior = self._imag_behavior.to(self._world_model.device)
+        print('Finish construct Dreamer Branch imagination behavior')
 
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
@@ -372,6 +386,11 @@ class WMPRunner:
                 wm_metrics = self.train_world_model()
                 for name, values in wm_metrics.items():
                     self.writer.add_scalar('World_model/' + name, float(np.mean(values)), it)
+
+                if self.use_imagination_learning and sum_wm_dataset_size > self.imagination_start_after:
+                    imag_metrics = self.train_imagination_behavior()
+                    for name, values in imag_metrics.items():
+                        self.writer.add_scalar('ImagBehavior/' + name, float(np.mean(values)), it)
             print('training world model time:', time.time() - start_time)
 
             # copy the config file
@@ -441,40 +460,69 @@ class WMPRunner:
         wm_metrics = {}
         mets = {}
         for i in range(self.wm_config.train_steps_per_iter):
-            p = self.wm_dataset_size / np.sum(self.wm_dataset_size)
-            batch_idx = np.random.choice(range(self.env.num_envs), self.wm_config.batch_size, replace=True,
-                                         p=p)
-            batch_length = min(int(self.wm_dataset_size[batch_idx].min()), self.wm_config.batch_length)
-            if (batch_length <= 1):
-                continue  # an error occur about the predict loss if batch_length < 1
-            batch_end_idx = [np.random.randint(batch_length, self.wm_dataset_size[idx] + 1) for idx in batch_idx]
-            batch_data = {}
-            for k, v in self.wm_dataset.items():
-                if (k == "forward_height_map"):
-                    continue
-                value = []
-                for idx, end_idx in zip(batch_idx, batch_end_idx):
-                    if (k == "image"):
-                        idx_in_buffer = np.where(self.env.depth_index == idx)[0]
-                        if (len(idx_in_buffer) == 0):
-                            # not in the buffer, use the predicted ones
-                            tmp_forward_heightmap = self.wm_dataset["forward_height_map"][idx,
-                                                    end_idx - batch_length: end_idx]
-                            tmp_prop = self.wm_dataset["prop"][idx, end_idx - batch_length: end_idx]
-                            pred_depth_image = self.depth_predictor(tmp_forward_heightmap, tmp_prop)
-                            value.append(pred_depth_image)
-                        else:
-                            value.append(v[idx_in_buffer[0], end_idx - batch_length: end_idx])
-                    else:
-                        value.append(v[idx, end_idx - batch_length: end_idx])
-                value = torch.stack(value)
-                batch_data[k] = value
-            is_first = torch.zeros((self.wm_config.batch_size, batch_length))
-            is_first[:, 0] = 1
-            batch_data["is_first"] = is_first
+            batch_data = self.sample_world_model_batch()
+            if batch_data is None:
+                continue
             post, context, mets = self._world_model._train(batch_data)
         wm_metrics.update(mets)
         return wm_metrics
+
+    def sample_world_model_batch(self):
+        p = self.wm_dataset_size / np.sum(self.wm_dataset_size)
+        batch_idx = np.random.choice(range(self.env.num_envs), self.wm_config.batch_size, replace=True,
+                                     p=p)
+        batch_length = min(int(self.wm_dataset_size[batch_idx].min()), self.wm_config.batch_length)
+        if (batch_length <= 1):
+            return None
+        batch_end_idx = [np.random.randint(batch_length, self.wm_dataset_size[idx] + 1) for idx in batch_idx]
+        batch_data = {}
+        for k, v in self.wm_dataset.items():
+            if (k == "forward_height_map"):
+                continue
+            value = []
+            for idx, end_idx in zip(batch_idx, batch_end_idx):
+                if (k == "image"):
+                    idx_in_buffer = np.where(self.env.depth_index == idx)[0]
+                    if (len(idx_in_buffer) == 0):
+                        tmp_forward_heightmap = self.wm_dataset["forward_height_map"][idx,
+                                                end_idx - batch_length: end_idx]
+                        tmp_prop = self.wm_dataset["prop"][idx, end_idx - batch_length: end_idx]
+                        pred_depth_image = self.depth_predictor(tmp_forward_heightmap, tmp_prop)
+                        value.append(pred_depth_image)
+                    else:
+                        value.append(v[idx_in_buffer[0], end_idx - batch_length: end_idx])
+                else:
+                    value.append(v[idx, end_idx - batch_length: end_idx])
+            value = torch.stack(value)
+            batch_data[k] = value
+        is_first = torch.zeros((self.wm_config.batch_size, batch_length))
+        is_first[:, 0] = 1
+        batch_data["is_first"] = is_first
+        return batch_data
+
+    def train_imagination_behavior(self):
+        imag_metrics = {}
+        if self._imag_behavior is None:
+            return imag_metrics
+        for _ in range(self.imagination_updates_per_iter):
+            batch_data = self.sample_world_model_batch()
+            if batch_data is None:
+                continue
+            with torch.no_grad():
+                data = self._world_model.preprocess(batch_data)
+                embed = self._world_model.encoder(data)
+                post, _ = self._world_model.dynamics.observe(
+                    embed, data["action"], data["is_first"]
+                )
+
+            def reward_fn(feat, state, action):
+                del feat, action
+                state_feat = self._world_model.dynamics.get_feat(state)
+                return self._world_model.heads["reward"](state_feat).mode()
+
+            mets = self._imag_behavior.train_from_posterior(post, reward_fn)
+            imag_metrics.update(mets)
+        return imag_metrics
 
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -561,6 +609,9 @@ class WMPRunner:
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
             'world_model_dict': self._world_model.state_dict(),
             'wm_optimizer_state_dict': self._world_model._model_opt._opt.state_dict(),
+            'imag_behavior_dict': self._imag_behavior.state_dict() if self._imag_behavior is not None else None,
+            'imag_actor_optimizer_state_dict': self._imag_behavior._actor_opt._opt.state_dict() if self._imag_behavior is not None else None,
+            'imag_value_optimizer_state_dict': self._imag_behavior._value_opt._opt.state_dict() if self._imag_behavior is not None else None,
             'depth_predictor': self.depth_predictor.state_dict(),
             # 'discriminator_state_dict': self.alg.discriminator.state_dict(),
             # 'amp_normalizer': self.alg.amp_normalizer,
@@ -572,6 +623,15 @@ class WMPRunner:
         loaded_dict = torch.load(path, map_location=self.device)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'], strict=False)
         self._world_model.load_state_dict(loaded_dict['world_model_dict'], strict=False)
+        if self._imag_behavior is not None and loaded_dict.get('imag_behavior_dict') is not None:
+            self._imag_behavior.load_state_dict(loaded_dict['imag_behavior_dict'], strict=False)
+            if load_wm_optimizer:
+                actor_opt_state = loaded_dict.get('imag_actor_optimizer_state_dict')
+                value_opt_state = loaded_dict.get('imag_value_optimizer_state_dict')
+                if actor_opt_state is not None:
+                    self._imag_behavior._actor_opt._opt.load_state_dict(actor_opt_state)
+                if value_opt_state is not None:
+                    self._imag_behavior._value_opt._opt.load_state_dict(value_opt_state)
         if(load_wm_optimizer):
             self._world_model._model_opt._opt.load_state_dict(loaded_dict['wm_optimizer_state_dict'])
         # self.alg.discriminator.load_state_dict(loaded_dict['discriminator_state_dict'], strict=False)

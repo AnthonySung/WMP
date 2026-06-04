@@ -328,6 +328,10 @@ class A1AMPCfgPPO(LeggedRobotCfgPPO):
         amp_discr_hidden_dims = [1024, 512]
 
         min_normalized_std = [0.05, 0.02, 0.05] * 4
+        use_imagination_learning = False
+        imagination_replace_ppo = False
+        imagination_start_after = 10000
+        imagination_updates_per_iter = 1
 
     class depth_predictor:
         lr = 3e-4
@@ -336,4 +340,3 @@ class A1AMPCfgPPO(LeggedRobotCfgPPO):
         training_iters = 1000
         batch_size = 1024
         loss_scale = 100
-
