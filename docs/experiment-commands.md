@@ -192,7 +192,7 @@ CUDA_VISIBLE_DEVICES=0 timeout 180 /root/miniconda3/bin/python legged_gym/script
 
 ```text
 Dreamer mode align iter 0: p_dreamer=1.000
-Dreamer mode align iter 1: p_dreamer=1.000
+Dreamer mode align iter 1: p_dreamer=1.000, dataset=166
 ```
 
 非视觉 takeover 短跑：
@@ -211,7 +211,30 @@ CUDA_VISIBLE_DEVICES=0 timeout 180 /root/miniconda3/bin/python legged_gym/script
 
 ```text
 Dreamer mode takeover iter 0: p_dreamer=0.000
-Dreamer mode takeover iter 1: p_dreamer=0.000
+Dreamer mode takeover iter 1: p_dreamer=0.000, dataset=28
+```
+
+强制 takeover mask / 接管路径短跑：
+
+```bash
+cd /home/WMP
+CUDA_VISIBLE_DEVICES=0 timeout 240 /root/miniconda3/bin/python legged_gym/scripts/train.py \
+  --headless \
+  --wmp_training_mode=takeover \
+  --num_envs=32 \
+  --max_iterations=3 \
+  --dreamer_control_start_after=0 \
+  --dreamer_takeover_iters=1 \
+  --sim_device=cuda:0 \
+  --run_name=WMP_takeover_mask_smoke
+```
+
+已验证输出包含：
+
+```text
+Dreamer mode takeover iter 0: p_dreamer=0.000
+Dreamer mode takeover iter 1: p_dreamer=1.000
+Dreamer mode takeover iter 2: p_dreamer=1.000
 ```
 
 非视觉 aligned play：
