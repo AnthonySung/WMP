@@ -194,3 +194,8 @@ class ImagBehavior(nn.Module):
                 for src, dst in zip(self.value.parameters(), self._slow_value.parameters()):
                     dst.data = mix * src.data + (1 - mix) * dst.data
             self._updates += 1
+
+    def act_from_state(self, state, deterministic=False):
+        feat = self._world_model.dynamics.get_feat(state)
+        dist = self.actor(feat)
+        return dist.mode() if deterministic else dist.sample()

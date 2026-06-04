@@ -78,18 +78,19 @@ class WorldModel(nn.Module):
             device=config.device,
             name="Reward",
         )
-        # self.heads["cont"] = networks.MLP(
-        #     feat_size,
-        #     (),
-        #     config.cont_head["layers"],
-        #     config.units,
-        #     config.act,
-        #     config.norm,
-        #     dist="binary",
-        #     outscale=config.cont_head["outscale"],
-        #     device=config.device,
-        #     name="Cont",
-        # )
+        if getattr(config, "use_cont_head", False):
+            self.heads["cont"] = networks.MLP(
+                feat_size,
+                (),
+                config.cont_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist="binary",
+                outscale=config.cont_head["outscale"],
+                device=config.device,
+                name="Cont",
+            )
         for name in config.grad_heads:
             assert name in self.heads, name
         self._model_opt = tools.Optimizer(
@@ -111,7 +112,7 @@ class WorldModel(nn.Module):
             reward=config.reward_head["loss_scale"],
             image = 1.0,
             # clean_prop = 0,
-            # cont=config.cont_head["loss_scale"],
+            cont=config.cont_head["loss_scale"],
         )
 
     def _train(self, data):
@@ -191,10 +192,9 @@ class WorldModel(nn.Module):
             # obs["discount"] = torch.Tensor(obs["discount"]).unsqueeze(-1)
         # 'is_first' is necesarry to initialize hidden state at training
         assert "is_first" in obs
-        # 'is_terminal' is necesarry to train cont_head
-        # assert "is_terminal" in obs
-        # obs["cont"] = torch.Tensor(1.0 - obs["is_terminal"]).unsqueeze(-1)
         obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
+        if "is_terminal" in obs and getattr(self._config, "use_cont_head", False):
+            obs["cont"] = (1.0 - obs["is_terminal"]).unsqueeze(-1)
         return obs
 
     def video_pred(self, data):

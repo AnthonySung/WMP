@@ -328,10 +328,16 @@ class A1AMPCfgPPO(LeggedRobotCfgPPO):
         amp_discr_hidden_dims = [1024, 512]
 
         min_normalized_std = [0.05, 0.02, 0.05] * 4
+        wmp_training_mode = "wmp"  # "wmp", "align", or "takeover"
         use_imagination_learning = False
         imagination_replace_ppo = False
         imagination_start_after = 10000
         imagination_updates_per_iter = 1
+        dreamer_use_image = False
+        dreamer_control_start_after = 10000
+        dreamer_takeover_iters = 5000
+        dreamer_reward_mode = "env"
+        dreamer_distill_coef = 0.0
 
     class depth_predictor:
         lr = 3e-4

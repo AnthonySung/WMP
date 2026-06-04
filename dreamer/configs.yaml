@@ -61,3 +61,4 @@ defaults:
   imag_gradient: 'dynamics'
   imag_gradient_mix: 0.0
   reward_EMA: False
+  use_cont_head: False

@@ -85,11 +85,20 @@ class WMPRunner:
         else:
             num_actor_obs = self.env.num_obs
 
-
+        self.training_mode = self.cfg.get("wmp_training_mode", "wmp")
+        if self.training_mode not in ("wmp", "align", "takeover"):
+            raise ValueError(f"Unsupported wmp_training_mode: {self.training_mode}")
+        self.is_dreamer_mode = self.training_mode in ("align", "takeover")
+        self.dreamer_use_image = self.cfg.get("dreamer_use_image", False)
+        self.dreamer_control_start_after = self.cfg.get("dreamer_control_start_after", 10000)
+        self.dreamer_takeover_iters = self.cfg.get("dreamer_takeover_iters", 5000)
+        self.dreamer_reward_mode = self.cfg.get("dreamer_reward_mode", "env")
+        self.dreamer_distill_coef = self.cfg.get("dreamer_distill_coef", 0.0)
+        self._takeover_start_it = None
 
         # build world model
         self._build_world_model()
-        self.use_imagination_learning = self.cfg.get("use_imagination_learning", False)
+        self.use_imagination_learning = self.cfg.get("use_imagination_learning", False) or self.is_dreamer_mode
         self.imagination_replace_ppo = self.cfg.get("imagination_replace_ppo", False)
         self.imagination_start_after = self.cfg.get("imagination_start_after", self.wm_config.train_start_steps)
         self.imagination_updates_per_iter = self.cfg.get("imagination_updates_per_iter", 1)
@@ -98,9 +107,12 @@ class WMPRunner:
             self._build_imag_behavior()
 
         # build depth predictor
-        self.depth_predictor = DepthPredictor().to(self._world_model.device)
-        self.depth_predictor_opt = optim.Adam(self.depth_predictor.parameters(), lr=self.depth_predictor_cfg["lr"],
-                                              weight_decay=self.depth_predictor_cfg["weight_decay"])
+        self.depth_predictor = None
+        self.depth_predictor_opt = None
+        if not self.is_dreamer_mode or self.dreamer_use_image:
+            self.depth_predictor = DepthPredictor().to(self._world_model.device)
+            self.depth_predictor_opt = optim.Adam(self.depth_predictor.parameters(), lr=self.depth_predictor_cfg["lr"],
+                                                  weight_decay=self.depth_predictor_cfg["weight_decay"])
 
         self.history_dim = history_length * (self.env.num_obs - self.env.privileged_dim - self.env.height_dim-3) #exclude command
         actor_critic = ActorCriticWMP(num_actor_obs=num_actor_obs,
@@ -177,12 +189,19 @@ class WMPRunner:
         # allow world model and rl env on different device
         if (self.wm_config.wm_device != 'None'):
             self.wm_config.device = self.wm_config.wm_device
-        self.wm_config.num_actions = self.wm_config.num_actions * self.env.cfg.depth.update_interval
+        if self.is_dreamer_mode:
+            self.wm_config.num_actions = self.env.num_actions
+            self.wm_config.use_cont_head = True
+        else:
+            self.wm_config.num_actions = self.wm_config.num_actions * self.env.cfg.depth.update_interval
         prop_dim = self.env.num_obs - self.env.privileged_dim - self.env.height_dim - self.env.num_actions
         image_shape = self.env.cfg.depth.resized + (1,)
-        obs_shape = {'prop': (prop_dim,), 'image': image_shape,}
+        obs_shape = {'prop': (prop_dim,)}
+        if (not self.is_dreamer_mode and self.env.cfg.depth.use_camera) or (self.is_dreamer_mode and self.dreamer_use_image):
+            obs_shape["image"] = image_shape
 
-        self._world_model = WorldModel(self.wm_config, obs_shape, use_camera=self.env.cfg.depth.use_camera)
+        use_camera = self.env.cfg.depth.use_camera if not self.is_dreamer_mode else self.dreamer_use_image
+        self._world_model = WorldModel(self.wm_config, obs_shape, use_camera=use_camera)
         self._world_model = self._world_model.to(self._world_model.device)
         print('Finish construct world model')
         self.wm_feature_dim = self.wm_config.dyn_deter #+ self.wm_config.dyn_stoch * self.wm_config.dyn_discrete
@@ -193,8 +212,272 @@ class WMPRunner:
         self._imag_behavior = self._imag_behavior.to(self._world_model.device)
         print('Finish construct Dreamer Branch imagination behavior')
 
+    def _get_wm_prop(self, obs):
+        return obs[:, self.env.privileged_dim: self.env.privileged_dim + self.env.cfg.env.prop_dim].to(self._world_model.device)
+
+    def _get_history_obs(self, obs):
+        return torch.concat((obs[:, self.env.privileged_dim:self.env.privileged_dim + 6],
+                             obs[:, self.env.privileged_dim + 9:-self.env.height_dim]), dim=1)
+
+    def _log_scalar(self, name, value, step):
+        if self.writer is not None:
+            self.writer.add_scalar(name, float(np.mean(value)), step)
+
+    def _takeover_probability(self, it, dataset_size):
+        if self.training_mode == "align":
+            return 1.0
+        if dataset_size < self.dreamer_control_start_after:
+            return 0.0
+        if self._takeover_start_it is None:
+            self._takeover_start_it = it
+        if self.dreamer_takeover_iters <= 0:
+            return 1.0
+        progress = (it - self._takeover_start_it) / float(self.dreamer_takeover_iters)
+        return float(np.clip(progress, 0.0, 1.0))
+
+    def init_dreamer_dataset(self):
+        horizon = int(self.env.max_episode_length) + 3
+        self.dreamer_dataset = {
+            "prop": torch.zeros((self.env.num_envs, horizon, self.env.cfg.env.prop_dim), device=self._world_model.device),
+            "action": torch.zeros((self.env.num_envs, horizon, self.env.num_actions), device=self._world_model.device),
+            "reward": torch.zeros((self.env.num_envs, horizon), device=self._world_model.device),
+            "is_terminal": torch.zeros((self.env.num_envs, horizon), device=self._world_model.device),
+        }
+        self.dreamer_buffer = {
+            "prop": torch.zeros((self.env.num_envs, horizon, self.env.cfg.env.prop_dim), device='cpu'),
+            "action": torch.zeros((self.env.num_envs, horizon, self.env.num_actions), device='cpu'),
+            "reward": torch.zeros((self.env.num_envs, horizon), device='cpu'),
+            "is_terminal": torch.zeros((self.env.num_envs, horizon), device='cpu'),
+        }
+        self.dreamer_dataset_size = np.zeros(self.env.num_envs)
+        self.dreamer_buffer_index = np.zeros(self.env.num_envs, dtype=np.int64)
+
+    def store_dreamer_step(self, prop, action, reward, done):
+        indices = np.arange(self.env.num_envs)
+        step = self.dreamer_buffer_index
+        capacity = self.dreamer_buffer["reward"].shape[1]
+        valid = step < capacity
+        if not np.any(valid):
+            return
+        env_ids = indices[valid]
+        step_ids = step[valid]
+        self.dreamer_buffer["prop"][env_ids, step_ids, :] = prop[env_ids].detach().to('cpu')
+        self.dreamer_buffer["action"][env_ids, step_ids, :] = action[env_ids].detach().to('cpu')
+        self.dreamer_buffer["reward"][env_ids, step_ids] = reward[env_ids].detach().to('cpu')
+        self.dreamer_buffer["is_terminal"][env_ids, step_ids] = done[env_ids].float().detach().to('cpu')
+        self.dreamer_buffer_index[env_ids] += 1
+
+    def flush_dreamer_resets(self, reset_env_ids):
+        if len(reset_env_ids) == 0:
+            return
+        for k, v in self.dreamer_dataset.items():
+            v[reset_env_ids, :] = self.dreamer_buffer[k][reset_env_ids].to(self._world_model.device)
+        self.dreamer_dataset_size[reset_env_ids] = self.dreamer_buffer_index[reset_env_ids]
+        for k, v in self.dreamer_buffer.items():
+            v[reset_env_ids].zero_()
+        self.dreamer_buffer_index[reset_env_ids] = 0
+
+    def sample_dreamer_batch(self):
+        total = np.sum(self.dreamer_dataset_size)
+        if total <= 0:
+            return None
+        p = self.dreamer_dataset_size / total
+        batch_idx = np.random.choice(range(self.env.num_envs), self.wm_config.batch_size, replace=True, p=p)
+        batch_length = min(int(self.dreamer_dataset_size[batch_idx].min()), self.wm_config.batch_length)
+        if batch_length <= 1:
+            return None
+        batch_end_idx = [np.random.randint(batch_length, self.dreamer_dataset_size[idx] + 1) for idx in batch_idx]
+        batch_data = {}
+        for k, v in self.dreamer_dataset.items():
+            batch_data[k] = torch.stack([
+                v[idx, end_idx - batch_length:end_idx] for idx, end_idx in zip(batch_idx, batch_end_idx)
+            ])
+        is_first = torch.zeros((self.wm_config.batch_size, batch_length))
+        is_first[:, 0] = 1
+        batch_data["is_first"] = is_first
+        return batch_data
+
+    def train_dreamer_world_model(self):
+        metrics = {}
+        mets = {}
+        for _ in range(self.wm_config.train_steps_per_iter):
+            batch_data = self.sample_dreamer_batch()
+            if batch_data is None:
+                continue
+            post, context, mets = self._world_model._train(batch_data)
+        metrics.update(mets)
+        return metrics
+
+    def train_dreamer_behavior(self):
+        metrics = {}
+        if self._imag_behavior is None:
+            return metrics
+        for _ in range(self.imagination_updates_per_iter):
+            batch_data = self.sample_dreamer_batch()
+            if batch_data is None:
+                continue
+            with torch.no_grad():
+                data = self._world_model.preprocess(batch_data)
+                embed = self._world_model.encoder(data)
+                post, _ = self._world_model.dynamics.observe(
+                    embed, data["action"], data["is_first"]
+                )
+
+            def reward_fn(feat, state, action):
+                del feat, action
+                state_feat = self._world_model.dynamics.get_feat(state)
+                return self._world_model.heads["reward"](state_feat).mode()
+
+            metrics.update(self._imag_behavior.train_from_posterior(post, reward_fn))
+        return metrics
+
+    def learn_dreamer_modes(self, num_learning_iterations, init_at_random_ep_len=False):
+        if self.log_dir is not None and self.writer is None:
+            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf,
+                                                             high=int(self.env.max_episode_length))
+
+        obs = self.env.get_observations().to(self.device)
+        privileged_obs = self.env.get_privileged_observations()
+        amp_obs = self.env.get_amp_observations().to(self.device)
+        critic_obs = (privileged_obs if privileged_obs is not None else obs).to(self.device)
+        self.alg.actor_critic.train()
+        self.alg.discriminator.train()
+
+        rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        self.trajectory_history = torch.zeros(size=(self.env.num_envs, self.history_length, self.env.num_obs -
+                                                    self.env.privileged_dim - self.env.height_dim - 3),
+                                              device=self.device)
+        self.trajectory_history = torch.concat(
+            (self.trajectory_history[:, 1:], self._get_history_obs(obs).unsqueeze(1)), dim=1)
+
+        self.init_dreamer_dataset()
+        dreamer_latent = dreamer_action = None
+        dreamer_is_first = torch.ones(self.env.num_envs, device=self._world_model.device)
+        wm_feature = torch.zeros((self.env.num_envs, self.wm_feature_dim), device=self._world_model.device)
+
+        tot_iter = self.current_learning_iteration + num_learning_iterations
+        for it in range(self.current_learning_iteration, tot_iter):
+            if self.env.cfg.rewards.reward_curriculum:
+                self.env.update_reward_curriculum(it)
+            p_dreamer = self._takeover_probability(it, np.sum(self.dreamer_dataset_size))
+            start = time.time()
+            used_ppo_rollout = False
+            used_mixed_controller = False
+            ep_infos = []
+
+            with torch.inference_mode():
+                for _ in range(self.num_steps_per_env):
+                    prop = self._get_wm_prop(obs)
+                    wm_obs = {"prop": prop, "is_first": dreamer_is_first}
+                    wm_embed = self._world_model.encoder(wm_obs)
+                    dreamer_latent, _ = self._world_model.dynamics.obs_step(
+                        dreamer_latent, dreamer_action, wm_embed, dreamer_is_first)
+                    wm_feature = self._world_model.dynamics.get_deter_feat(dreamer_latent)
+                    dreamer_is_first[:] = 0
+
+                    history = self.trajectory_history.flatten(1).to(self.device)
+                    train_ppo_this_step = self.training_mode == "takeover" and p_dreamer == 0.0
+                    if train_ppo_this_step:
+                        ppo_actions = self.alg.act(obs, critic_obs, amp_obs, history, wm_feature.to(self.device))
+                    else:
+                        ppo_actions = self.alg.actor_critic.act(obs, history, wm_feature.to(self.device)).detach()
+                    dreamer_actions = self._imag_behavior.act_from_state(
+                        dreamer_latent, deterministic=False).to(self.device)
+                    use_dreamer = torch.rand(self.env.num_envs, device=self.device) < p_dreamer
+                    if self.training_mode == "align":
+                        use_dreamer[:] = True
+                    used_ppo_rollout = used_ppo_rollout or bool((~use_dreamer).any().item())
+                    used_mixed_controller = used_mixed_controller or bool(use_dreamer.any().item())
+                    actions = torch.where(use_dreamer.unsqueeze(-1), dreamer_actions, ppo_actions)
+
+                    obs, privileged_obs, env_rewards, dones, infos, reset_env_ids, terminal_amp_states = self.env.step(actions)
+                    next_amp_obs = self.env.get_amp_observations()
+                    critic_obs = privileged_obs if privileged_obs is not None else obs
+                    obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+                    next_amp_obs, env_rewards, dones = next_amp_obs.to(self.device), env_rewards.to(self.device), dones.to(self.device)
+
+                    next_amp_obs_with_term = torch.clone(next_amp_obs)
+                    reset_env_ids_np = reset_env_ids.cpu().numpy()
+                    next_amp_obs_with_term[reset_env_ids_np] = terminal_amp_states
+                    amp_rewards = self.alg.discriminator.predict_amp_reward(
+                        amp_obs, next_amp_obs_with_term, env_rewards, normalizer=self.alg.amp_normalizer)[0]
+                    train_rewards = env_rewards if self.dreamer_reward_mode == "env" else amp_rewards
+
+                    next_prop = self._get_wm_prop(obs)
+                    self.store_dreamer_step(next_prop, actions.to(self._world_model.device),
+                                            train_rewards.to(self._world_model.device), dones.to(self._world_model.device))
+                    self.flush_dreamer_resets(reset_env_ids_np)
+
+                    if train_ppo_this_step:
+                        self.alg.process_env_step(amp_rewards, dones, infos, next_amp_obs_with_term)
+                    amp_obs = torch.clone(next_amp_obs)
+                    dreamer_action = actions.to(self._world_model.device)
+
+                    env_ids = dones.nonzero(as_tuple=False).flatten()
+                    self.trajectory_history[env_ids] = 0
+                    self.trajectory_history = torch.concat(
+                        (self.trajectory_history[:, 1:], self._get_history_obs(obs).unsqueeze(1)), dim=1)
+                    if len(reset_env_ids_np) > 0:
+                        dreamer_is_first[reset_env_ids_np] = 1
+                        dreamer_action[reset_env_ids_np] = 0
+
+                    if self.log_dir is not None:
+                        if 'episode' in infos:
+                            ep_infos.append(infos['episode'])
+                        cur_reward_sum += train_rewards
+                        cur_episode_length += 1
+                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+
+                collection_time = time.time() - start
+                learn_start = time.time()
+                if self.training_mode == "takeover" and p_dreamer == 0.0:
+                    self.alg.compute_returns(critic_obs, wm_feature.to(self.device))
+            if self.training_mode == "takeover" and p_dreamer == 0.0:
+                ppo_metrics = self.alg.update()
+            else:
+                ppo_metrics = (0, 0, 0, 0, 0, 0, 0)
+            learn_time = time.time() - learn_start
+
+            wm_metrics = {}
+            imag_metrics = {}
+            dataset_size = np.sum(self.dreamer_dataset_size)
+            if dataset_size > self.wm_config.train_start_steps:
+                wm_metrics = self.train_dreamer_world_model()
+                imag_metrics = self.train_dreamer_behavior()
+
+            if self.writer is not None:
+                self._log_scalar('DreamerMode/p_dreamer', p_dreamer, it)
+                self._log_scalar('DreamerMode/dataset_size', dataset_size, it)
+                for name, values in wm_metrics.items():
+                    self._log_scalar('World_model/' + name, values, it)
+                for name, values in imag_metrics.items():
+                    self._log_scalar('ImagBehavior/' + name, values, it)
+                if len(rewbuffer) > 0:
+                    self._log_scalar('Train/mean_reward', statistics.mean(rewbuffer), it)
+                    self._log_scalar('Train/mean_episode_length', statistics.mean(lenbuffer), it)
+
+            if it % self.save_interval == 0:
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            print(f"Dreamer mode {self.training_mode} iter {it}: p_dreamer={p_dreamer:.3f}, "
+                  f"dataset={dataset_size:.0f}, collection={collection_time:.2f}s, learning={learn_time:.2f}s")
+
+        self.current_learning_iteration += num_learning_iterations
+        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if self.is_dreamer_mode:
+            return self.learn_dreamer_modes(num_learning_iterations, init_at_random_ep_len)
+
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
@@ -377,7 +660,7 @@ class WMPRunner:
             start_time = time.time()
             if (sum_wm_dataset_size > self.wm_config.train_start_steps):
 
-                if(it % self.depth_predictor_cfg["training_interval"] == 0):
+                if(self.depth_predictor is not None and it % self.depth_predictor_cfg["training_interval"] == 0):
                 # Train Depth Predictor
                     depth_mse_loss = self.train_depth_predictor()
                     self.writer.add_scalar('DepthPredictor/loss', depth_mse_loss, it)
@@ -612,7 +895,7 @@ class WMPRunner:
             'imag_behavior_dict': self._imag_behavior.state_dict() if self._imag_behavior is not None else None,
             'imag_actor_optimizer_state_dict': self._imag_behavior._actor_opt._opt.state_dict() if self._imag_behavior is not None else None,
             'imag_value_optimizer_state_dict': self._imag_behavior._value_opt._opt.state_dict() if self._imag_behavior is not None else None,
-            'depth_predictor': self.depth_predictor.state_dict(),
+            'depth_predictor': self.depth_predictor.state_dict() if self.depth_predictor is not None else None,
             # 'discriminator_state_dict': self.alg.discriminator.state_dict(),
             # 'amp_normalizer': self.alg.amp_normalizer,
             'iter': self.current_learning_iteration,
