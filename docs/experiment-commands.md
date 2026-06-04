@@ -142,3 +142,93 @@ CUDA_VISIBLE_DEVICES=3 python legged_gym/scripts/play.py \
 - 如果命令不带 `--dreamer_use_image`，`align`/`takeover` 不应再出现 `acquiring depth image time`。
 - 如果带 `--dreamer_use_image`，出现 `acquiring depth image time` 是预期行为。
 - 三组主实验建议优先跑 `wmp/align/takeover` prop-only，对齐后再跑视觉版 `align_image/takeover_image`。
+
+## 单 GPU 云端 Smoke Test
+
+云端路径：`/home/WMP`。该云 GPU 只有一张卡，使用 `CUDA_VISIBLE_DEVICES=0`，Python 使用 `/root/miniconda3/bin/python`。
+
+同步代码：
+
+```bash
+cd /home/WMP
+git fetch origin dreamer
+git reset --hard origin/dreamer
+```
+
+语法检查：
+
+```bash
+cd /home/WMP
+/root/miniconda3/bin/python -m compileall \
+  legged_gym/scripts/train.py \
+  legged_gym/scripts/play.py \
+  legged_gym/utils/helpers.py \
+  legged_gym/utils/task_registry.py \
+  rsl_rl/runners/wmp_runner.py
+```
+
+非视觉 Dreamer aligned 短跑：
+
+```bash
+cd /home/WMP
+CUDA_VISIBLE_DEVICES=0 timeout 180 /root/miniconda3/bin/python legged_gym/scripts/train.py \
+  --headless \
+  --wmp_training_mode=align \
+  --num_envs=32 \
+  --max_iterations=2 \
+  --sim_device=cuda:0
+```
+
+已验证输出包含：
+
+```text
+Dreamer mode align iter 0: p_dreamer=1.000
+Dreamer mode align iter 1: p_dreamer=1.000
+```
+
+非视觉 takeover 短跑：
+
+```bash
+cd /home/WMP
+CUDA_VISIBLE_DEVICES=0 timeout 180 /root/miniconda3/bin/python legged_gym/scripts/train.py \
+  --headless \
+  --wmp_training_mode=takeover \
+  --num_envs=32 \
+  --max_iterations=2 \
+  --sim_device=cuda:0
+```
+
+已验证输出包含：
+
+```text
+Dreamer mode takeover iter 0: p_dreamer=0.000
+Dreamer mode takeover iter 1: p_dreamer=0.000
+```
+
+非视觉 aligned play：
+
+```bash
+cd /home/WMP
+CUDA_VISIBLE_DEVICES=0 timeout 180 /root/miniconda3/bin/python legged_gym/scripts/play.py \
+  --headless \
+  --wmp_training_mode=align \
+  --terrain=climb \
+  --sim_device=cuda:0
+```
+
+已验证会加载 `logs/a1_amp_example/WMP_align/model_2.pt` 并输出 `total reward`。
+
+非视觉 takeover play：
+
+```bash
+cd /home/WMP
+CUDA_VISIBLE_DEVICES=0 timeout 180 /root/miniconda3/bin/python legged_gym/scripts/play.py \
+  --headless \
+  --wmp_training_mode=takeover \
+  --terrain=climb \
+  --sim_device=cuda:0
+```
+
+已验证会加载 `logs/a1_amp_example/WMP_takeover/model_2.pt` 并输出 `total reward`。
+
+该云 GPU 的 Isaac Gym depth camera/headless 图形栈会在视觉路径 core dump，原始 `wmp` 视觉和 `--dreamer_use_image` 都会触发。因此云端 smoke test 只验证 prop-only 的 `align/takeover` 路径；视觉实验留给本地可正常采集 depth 的机器。
