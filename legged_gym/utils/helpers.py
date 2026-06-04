@@ -168,6 +168,15 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
 
     return env_cfg, cfg_train
 
+def apply_dreamer_env_overrides(env_cfg, train_cfg):
+    if env_cfg is None or train_cfg is None:
+        return env_cfg
+    mode = getattr(train_cfg.runner, "wmp_training_mode", "wmp")
+    dreamer_use_image = getattr(train_cfg.runner, "dreamer_use_image", False)
+    if mode in ("align", "takeover") and not dreamer_use_image:
+        env_cfg.depth.use_camera = False
+    return env_cfg
+
 def get_args():
     custom_parameters = [
         {"name": "--task", "type": str, "default": "anymal_c_flat", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},

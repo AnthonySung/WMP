@@ -43,15 +43,18 @@ os.sys.path.insert(0, parentdir)
 import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry
+from legged_gym.utils.helpers import update_cfg_from_args, apply_dreamer_env_overrides
 import torch
 
 def train(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+    env_cfg, train_cfg = update_cfg_from_args(env_cfg, train_cfg, args)
 
     train_cfg.runner.run_name = 'WMP'
 
     train_cfg.runner.max_iterations = 100000
     train_cfg.runner.save_interval = 1000
+    env_cfg = apply_dreamer_env_overrides(env_cfg, train_cfg)
 
     env, env_cfg = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     ppo_runner, train_cfg = task_registry.make_wmp_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)

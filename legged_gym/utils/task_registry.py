@@ -93,6 +93,10 @@ class TaskRegistry():
             env_cfg, _ = self.get_cfgs(name)
         # override cfg from args (if specified)
         env_cfg, _ = update_cfg_from_args(env_cfg, None, args)
+        mode = getattr(args, "wmp_training_mode", None)
+        dreamer_use_image = bool(getattr(args, "dreamer_use_image", False))
+        if mode in ("align", "takeover") and not dreamer_use_image:
+            env_cfg.depth.use_camera = False
         set_seed(env_cfg.seed)
         # parse sim params (convert to dict first)
         sim_params = {"sim": class_to_dict(env_cfg.sim)}
