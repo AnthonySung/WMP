@@ -242,12 +242,14 @@ class WMPRunner:
             "action": torch.zeros((self.env.num_envs, horizon, self.env.num_actions), device=self._world_model.device),
             "reward": torch.zeros((self.env.num_envs, horizon), device=self._world_model.device),
             "is_terminal": torch.zeros((self.env.num_envs, horizon), device=self._world_model.device),
+            "is_first": torch.zeros((self.env.num_envs, horizon), device=self._world_model.device),
         }
         self.dreamer_buffer = {
             "prop": torch.zeros((self.env.num_envs, horizon, self.env.cfg.env.prop_dim), device='cpu'),
             "action": torch.zeros((self.env.num_envs, horizon, self.env.num_actions), device='cpu'),
             "reward": torch.zeros((self.env.num_envs, horizon), device='cpu'),
             "is_terminal": torch.zeros((self.env.num_envs, horizon), device='cpu'),
+            "is_first": torch.zeros((self.env.num_envs, horizon), device='cpu'),
         }
         if self.dreamer_use_image:
             image_shape = self.env.cfg.depth.resized + (1,)
@@ -258,7 +260,7 @@ class WMPRunner:
         self.dreamer_dataset_size = np.zeros(self.env.num_envs)
         self.dreamer_buffer_index = np.zeros(self.env.num_envs, dtype=np.int64)
 
-    def store_dreamer_step(self, prop, action, reward, done, image=None):
+    def store_dreamer_step(self, prop, action, reward, done, is_first, image=None):
         indices = np.arange(self.env.num_envs)
         step = self.dreamer_buffer_index
         capacity = self.dreamer_buffer["reward"].shape[1]
@@ -271,6 +273,7 @@ class WMPRunner:
         self.dreamer_buffer["action"][env_ids, step_ids, :] = action[env_ids].detach().to('cpu')
         self.dreamer_buffer["reward"][env_ids, step_ids] = reward[env_ids].detach().to('cpu')
         self.dreamer_buffer["is_terminal"][env_ids, step_ids] = done[env_ids].float().detach().to('cpu')
+        self.dreamer_buffer["is_first"][env_ids, step_ids] = is_first[env_ids].float().detach().to('cpu')
         if self.dreamer_use_image:
             if image is None:
                 raise ValueError("dreamer_use_image=True requires image data in store_dreamer_step().")
@@ -315,9 +318,6 @@ class WMPRunner:
             batch_data[k] = torch.stack([
                 v[idx, end_idx - batch_length:end_idx] for idx, end_idx in zip(batch_idx, batch_end_idx)
             ])
-        is_first = torch.zeros((self.wm_config.batch_size, batch_length))
-        is_first[:, 0] = 1
-        batch_data["is_first"] = is_first
         return batch_data
 
     def train_dreamer_world_model(self):
@@ -382,6 +382,7 @@ class WMPRunner:
         self.init_dreamer_dataset()
         dreamer_latent = dreamer_action = None
         dreamer_is_first = torch.ones(self.env.num_envs, device=self._world_model.device)
+        dreamer_controller_mask = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
         wm_feature = torch.zeros((self.env.num_envs, self.wm_feature_dim), device=self._world_model.device)
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
@@ -393,6 +394,13 @@ class WMPRunner:
             used_ppo_rollout = False
             used_mixed_controller = False
             ep_infos = []
+            if self.training_mode == "align":
+                dreamer_controller_mask[:] = True
+            elif self.training_mode == "takeover":
+                first_env_ids = dreamer_is_first.bool().nonzero(as_tuple=False).flatten()
+                if len(first_env_ids) > 0:
+                    dreamer_controller_mask[first_env_ids] = (
+                        torch.rand(len(first_env_ids), device=self.device) < p_dreamer)
 
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -400,6 +408,9 @@ class WMPRunner:
                     wm_obs = {"prop": prop, "is_first": dreamer_is_first}
                     if self.dreamer_use_image:
                         wm_obs["image"] = last_image_obs
+                    transition_prop = prop
+                    transition_image = last_image_obs
+                    transition_is_first = dreamer_is_first.clone()
                     wm_embed = self._world_model.encoder(wm_obs)
                     dreamer_latent, _ = self._world_model.dynamics.obs_step(
                         dreamer_latent, dreamer_action, wm_embed, dreamer_is_first)
@@ -407,19 +418,18 @@ class WMPRunner:
                     dreamer_is_first[:] = 0
 
                     history = self.trajectory_history.flatten(1).to(self.device)
-                    train_ppo_this_step = self.training_mode == "takeover" and p_dreamer == 0.0
-                    if train_ppo_this_step:
+                    collect_ppo_this_step = self.training_mode == "takeover" and bool((~dreamer_controller_mask).any().item())
+                    if collect_ppo_this_step:
                         ppo_actions = self.alg.act(obs, critic_obs, amp_obs, history, wm_feature.to(self.device))
                     else:
                         ppo_actions = self.alg.actor_critic.act(obs, history, wm_feature.to(self.device)).detach()
                     dreamer_actions = self._imag_behavior.act_from_state(
                         dreamer_latent, deterministic=False).to(self.device)
-                    use_dreamer = torch.rand(self.env.num_envs, device=self.device) < p_dreamer
                     if self.training_mode == "align":
-                        use_dreamer[:] = True
-                    used_ppo_rollout = used_ppo_rollout or bool((~use_dreamer).any().item())
-                    used_mixed_controller = used_mixed_controller or bool(use_dreamer.any().item())
-                    actions = torch.where(use_dreamer.unsqueeze(-1), dreamer_actions, ppo_actions)
+                        dreamer_controller_mask[:] = True
+                    used_ppo_rollout = used_ppo_rollout or bool((~dreamer_controller_mask).any().item())
+                    used_mixed_controller = used_mixed_controller or bool(dreamer_controller_mask.any().item())
+                    actions = torch.where(dreamer_controller_mask.unsqueeze(-1), dreamer_actions, ppo_actions)
 
                     obs, privileged_obs, env_rewards, dones, infos, reset_env_ids, terminal_amp_states = self.env.step(actions)
                     next_amp_obs = self.env.get_amp_observations()
@@ -434,16 +444,17 @@ class WMPRunner:
                         amp_obs, next_amp_obs_with_term, env_rewards, normalizer=self.alg.amp_normalizer)[0]
                     train_rewards = env_rewards if self.dreamer_reward_mode == "env" else amp_rewards
 
-                    next_prop = self._get_wm_prop(obs)
                     last_image_obs = self._make_dreamer_image_obs(infos, fallback=last_image_obs)
-                    self.store_dreamer_step(next_prop, actions.to(self._world_model.device),
+                    self.store_dreamer_step(transition_prop, actions.to(self._world_model.device),
                                             train_rewards.to(self._world_model.device),
                                             dones.to(self._world_model.device),
-                                            image=last_image_obs)
+                                            transition_is_first,
+                                            image=transition_image)
                     self.flush_dreamer_resets(reset_env_ids_np)
 
-                    if train_ppo_this_step:
-                        self.alg.process_env_step(amp_rewards, dones, infos, next_amp_obs_with_term)
+                    ppo_valid_mask = (~dreamer_controller_mask).to(self.device)
+                    if collect_ppo_this_step:
+                        self.alg.process_env_step(amp_rewards, dones, infos, next_amp_obs_with_term, valid_mask=ppo_valid_mask)
                     amp_obs = torch.clone(next_amp_obs)
                     dreamer_action = actions.to(self._world_model.device)
 
@@ -454,6 +465,11 @@ class WMPRunner:
                     if len(reset_env_ids_np) > 0:
                         dreamer_is_first[reset_env_ids_np] = 1
                         dreamer_action[reset_env_ids_np] = 0
+                        if self.training_mode == "takeover":
+                            dreamer_controller_mask[reset_env_ids_np] = (
+                                torch.rand(len(reset_env_ids_np), device=self.device) < p_dreamer)
+                        elif self.training_mode == "align":
+                            dreamer_controller_mask[reset_env_ids_np] = True
 
                     if self.log_dir is not None:
                         if 'episode' in infos:
@@ -468,9 +484,9 @@ class WMPRunner:
 
                 collection_time = time.time() - start
                 learn_start = time.time()
-                if self.training_mode == "takeover" and p_dreamer == 0.0:
+                if self.training_mode == "takeover" and self.alg.storage.step > 0 and torch.any(self.alg.storage.valid_masks):
                     self.alg.compute_returns(critic_obs, wm_feature.to(self.device))
-            if self.training_mode == "takeover" and p_dreamer == 0.0:
+            if self.training_mode == "takeover" and self.alg.storage.step > 0 and torch.any(self.alg.storage.valid_masks):
                 ppo_metrics = self.alg.update()
             else:
                 ppo_metrics = (0, 0, 0, 0, 0, 0, 0)

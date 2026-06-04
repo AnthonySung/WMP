@@ -99,6 +99,13 @@ hybrid takeover 不是简单地把 PPO action 和 Dreamer action 混在一个 ba
 - 某些 episode 由 Dreamer 控制
 - 不建议第一版实验就做 step-level mixing
 
+当前 `dreamer` 分支实现状态：
+
+- 已采用 episode-level controller assignment。
+- 每个 env 在 reset 时按当前 `p_dreamer` 采样一次 controller，episode 内保持不变。
+- PPO 只从 PPO-controlled transition 更新，Dreamer-controlled transition 不进入 PPO loss。
+- World model replay 仍收集全部 transition，用于学习当前混合数据分布。
+
 ## 2. Takeover Schedule
 
 在 hybrid 实验中，可以引入 `p_dreamer` 之类的接管概率调度，例如：
@@ -108,6 +115,14 @@ hybrid takeover 不是简单地把 PPO action 和 Dreamer action 混在一个 ba
 - 后期 Dreamer 占主导
 
 但这类 schedule 只应在第二阶段中出现，而不进入主线 MVP。
+
+当前 `dreamer` 分支中该实验通过 `wmp_training_mode="takeover"` 开启，调度字段为：
+
+```python
+wmp_training_mode = "takeover"
+dreamer_control_start_after = 10000
+dreamer_takeover_iters = 5000
+```
 
 建议新增实验配置，例如：
 

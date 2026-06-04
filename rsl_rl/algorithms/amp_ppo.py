@@ -141,17 +141,22 @@ class AMPPPO:
         self.amp_transition.observations = amp_obs
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos, amp_obs):
+    def process_env_step(self, rewards, dones, infos, amp_obs, valid_mask=None):
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        if valid_mask is None:
+            valid_mask = torch.ones_like(dones, dtype=torch.bool, device=self.device)
+        else:
+            valid_mask = valid_mask.to(self.device).bool()
+        self.transition.valid_mask = valid_mask
         # Bootstrapping on time outs
         if 'time_outs' in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
 
-        not_done_idxs = (dones == False).nonzero().squeeze()
-        self.amp_storage.insert(
-            self.amp_transition.observations, amp_obs)
+        if torch.any(valid_mask):
+            self.amp_storage.insert(
+                self.amp_transition.observations[valid_mask], amp_obs[valid_mask])
 
         # Record the transition
         self.storage.add_transitions(self.transition)
@@ -178,6 +183,9 @@ class AMPPPO:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        if self.amp_storage.num_samples == 0 or not torch.any(self.storage.valid_masks):
+            self.storage.clear()
+            return mean_value_loss, mean_surrogate_loss, mean_vel_predict_loss, mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred
 
         amp_policy_generator = self.amp_storage.feed_forward_generator(
             self.num_learning_epochs * self.num_mini_batches,

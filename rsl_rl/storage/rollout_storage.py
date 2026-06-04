@@ -52,6 +52,7 @@ class RolloutStorage:
 
             self.history = None
             self.wm_feature = None
+            self.valid_mask = None
         
         def clear(self):
             self.__init__()
@@ -74,6 +75,7 @@ class RolloutStorage:
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.valid_masks = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device, dtype=torch.bool)
 
         self.history = torch.zeros(num_transitions_per_env, num_envs, history_dim, device=self.device)
         self.wm_features = torch.zeros(num_transitions_per_env, num_envs, wm_feature_dim, device=self.device)
@@ -108,6 +110,10 @@ class RolloutStorage:
 
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        if transition.valid_mask is None:
+            self.valid_masks[self.step].fill_(True)
+        else:
+            self.valid_masks[self.step].copy_(transition.valid_mask.view(-1, 1).bool())
         self.values[self.step].copy_(transition.values)
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
@@ -134,6 +140,7 @@ class RolloutStorage:
 
     def clear(self):
         self.step = 0
+        self.valid_masks.zero_()
 
     def compute_returns(self, last_values, gamma, lam):
         advantage = 0
@@ -149,7 +156,12 @@ class RolloutStorage:
 
         # Compute and normalize the advantages
         self.advantages = self.returns - self.values
-        self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+        valid_advantages = self.advantages[self.valid_masks]
+        if valid_advantages.numel() > 1:
+            self.advantages[self.valid_masks] = (
+                valid_advantages - valid_advantages.mean()) / (valid_advantages.std() + 1e-8)
+        elif valid_advantages.numel() == 1:
+            self.advantages[self.valid_masks] = 0.0
 
     def get_statistics(self):
         done = self.dones
@@ -160,10 +172,6 @@ class RolloutStorage:
         return trajectory_lengths.float().mean(), self.rewards.mean()
 
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
-        batch_size = self.num_envs * self.num_transitions_per_env
-        mini_batch_size = batch_size // num_mini_batches
-        indices = torch.randperm(num_mini_batches*mini_batch_size, requires_grad=False, device=self.device)
-
         observations = self.observations.flatten(0, 1)
         if self.privileged_observations is not None:
             critic_observations = self.privileged_observations.flatten(0, 1)
@@ -180,13 +188,20 @@ class RolloutStorage:
 
         history = self.history.flatten(0, 1)
         wm_feature = self.wm_features.flatten(0, 1)
+        valid_indices = self.valid_masks.flatten(0, 1).squeeze(-1).nonzero(as_tuple=False).flatten()
+        if valid_indices.numel() == 0:
+            return
+        mini_batch_size = max(1, valid_indices.numel() // num_mini_batches)
 
         for epoch in range(num_epochs):
+            shuffled = valid_indices[torch.randperm(valid_indices.numel(), requires_grad=False, device=self.device)]
             for i in range(num_mini_batches):
 
                 start = i*mini_batch_size
-                end = (i+1)*mini_batch_size
-                batch_idx = indices[start:end]
+                end = valid_indices.numel() if i == num_mini_batches - 1 else min((i+1)*mini_batch_size, valid_indices.numel())
+                if start >= end:
+                    continue
+                batch_idx = shuffled[start:end]
 
                 obs_batch = observations[batch_idx]
                 critic_observations_batch = critic_observations[batch_idx]

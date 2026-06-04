@@ -143,6 +143,15 @@ CUDA_VISIBLE_DEVICES=3 python legged_gym/scripts/play.py \
 - 如果带 `--dreamer_use_image`，出现 `acquiring depth image time` 是预期行为。
 - 三组主实验建议优先跑 `wmp/align/takeover` prop-only，对齐后再跑视觉版 `align_image/takeover_image`。
 
+## Code Review Fixes In Dreamer Modes
+
+当前 `dreamer` 分支已按 code review 修复 Dreamer replay 和 takeover 语义：
+
+- Dreamer replay 存储的是 pre-step transition：`obs[t]`, `action[t]`, `reward[t]`, `done[t]`，不再把 `obs[t+1]` 和 `action[t]` 错位配对。
+- replay 中保存真实 `is_first`，batch 采样不再人为把每个窗口第 0 步都标成 episode start。
+- takeover 使用 episode-level controller assignment，reset 时按 `p_dreamer` 采样该 episode 由 PPO 或 Dreamer 控制。
+- takeover 的 PPO 更新使用 `valid_mask`，只用 PPO-controlled transition 更新 PPO/AMP，Dreamer-controlled transition 只进入 Dreamer world model replay。
+
 ## 单 GPU 云端 Smoke Test
 
 云端路径：`/home/WMP`。该云 GPU 只有一张卡，使用 `CUDA_VISIBLE_DEVICES=0`，Python 使用 `/root/miniconda3/bin/python`。
